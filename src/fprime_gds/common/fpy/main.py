@@ -64,6 +64,8 @@ def compile_main(args: list[str] = None):
     fprime_gds.common.fpy.error.file_name = str(args.input)
 
     body = fpy_parse(args.input.read_text())
+    import pprint
+    pprint.pprint(body)
     directives = compile(body, args.dictionary)
     output = args.output
     if output is None:

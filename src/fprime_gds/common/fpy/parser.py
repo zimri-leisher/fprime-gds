@@ -41,8 +41,8 @@ class Ast:
     def __hash__(self):
         return hash(self.id)
 
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self.node_text})"
+    # def __repr__(self):
+    #     return f"{self.__class__.__name__}({self.node_text})"
 
 
 @dataclass
@@ -151,7 +151,7 @@ class AstScopedBody(Ast):
 
 for cls in Ast.__subclasses__():
     cls.__hash__ = Ast.__hash__
-    cls.__repr__ = Ast.__repr__
+    # cls.__repr__ = Ast.__repr__
 
 
 @v_args(meta=False, inline=False)
