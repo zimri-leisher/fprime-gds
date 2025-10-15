@@ -10,6 +10,8 @@ from typing import Union, get_origin, get_args
 import zlib
 
 from fprime_gds.common.fpy.ir import IrBasicBlock, IrFunction, IrModule
+from lark import Transformer
+
 from fprime_gds.common.fpy.model import DirectiveErrorCode
 from fprime_gds.common.fpy.frontend_types import (
     SPECIFIC_FLOAT_TYPES,
@@ -514,6 +516,8 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         self, node: AstExpr, type: FppTypeClass, state: FrontendState
     ) -> bool:
         unconverted_type = state.expr_unconverted_types[node]
+        # make sure it isn't already being coerced
+        assert unconverted_type == state.expr_converted_types[node], (unconverted_type, state.expr_converted_types[node])
         if self.can_coerce_type(unconverted_type, type):
             state.expr_converted_types[node] = type
             return True
@@ -823,10 +827,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         state.expr_converted_types[node] = BoolType
 
     def visit_AstFuncCall(self, node: AstFuncCall, state: FrontendState):
-        func = state.resolved_references.get(node.func)
-        if not isinstance(func, FpyCallable):
-            state.err("Unknown function", node.func)
-            return
+        func = state.resolved_references[node.func]
         func_args = func.args
         node_args = node.args if node.args else []
 
@@ -868,8 +869,6 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         lhs_type = None
         if isinstance(lhs_ref, FpyVariable):
             lhs_type = lhs_ref.type
-            if not self.coerce_expr_type(node.rhs, lhs_type, state):
-                return
         else:
             # briefly check that we're only trying
             # to modify an fpy var
@@ -900,13 +899,13 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         loop_var_ref = state.resolved_references[node.loop_var]
         loop_var_type = loop_var_ref.type
 
-        upper_bound_type = state.expr_unconverted_types[node.upper_bound]
-
-        intermediate_type = self.pick_intermediate_type([loop_var_type, upper_bound_type], BinaryStackOp.LESS_THAN)
+        # handle the loop condition check
+        # find intermediate type. we compare two variables of loop_var_type
+        intermediate_type = self.pick_intermediate_type([loop_var_type, loop_var_type], BinaryStackOp.LESS_THAN)
 
         if intermediate_type is None or intermediate_type is F64Type:
             state.err(
-                f"Loop variable and bounds must be signed or unsigned integers",
+                f"Loop variable type must be a signed or unsigned integer type",
                 node,
             )
             return
@@ -919,19 +918,18 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         # store it for later
         state.for_loop_comparison_directives[node] = comparison_dir
 
-        # handle set loop var to lower bound
-        # lower bound must be of type loop var
+        # upper and lower bounds must be coercible to loop variable type
         if not self.coerce_expr_type(node.lower_bound, loop_var_type, state):
             return
-
-        # handle set ub var to upper bound
-        # note, we store ub var as intermediate type because we only ever use it for comparison
-        # so it would always just get converted to intermediate type
-        if not self.coerce_expr_type(node.upper_bound, intermediate_type, state):
+        if not self.coerce_expr_type(node.upper_bound, loop_var_type, state):
             return
 
         # handle increment loop var
-        # don't have to handle it i think actually. TODO show why
+        # this looks like:
+        # loop_var = loop_var + 1
+        # LOAD, EXTEND, PUSH U64(1), IADD, TRUNC, STORE
+
+        self._visit(AstAssign(node.meta, node.loop_var, AstBinaryOp(node.meta, node.loop_var, "+", AstNumber(node.meta, 1))), state)
 
     def visit_AstWhile(self, node: AstWhile, state: FrontendState):
         if not self.coerce_expr_type(node.condition, BoolType, state):
@@ -944,6 +942,13 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
     def visit_default(self, node, state):
         # coding error, missed an expr
         assert not is_instance_compat(node, AstStmtWithExpr), node
+
+class LowerForLoopSyntax(Transformer):
+    """rewrites the tree to expand for loops into their given components"""
+    def visit_AstFor(self, node: AstFor, state: CompileState):
+
+
+
 
 
 class AllocateVariables(Visitor):
@@ -1634,6 +1639,7 @@ class GenerateExprMacrosAndCmds(Visitor):
         # convert the lower bound into the intermediate type
         pass
 
+# TODO rewrite the AST here
 
 class GenerateIrBlocks(Visitor):
     def visit_AstIf(self, node: AstIf, state: FrontendState):
