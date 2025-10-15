@@ -2,12 +2,13 @@ import argparse
 from pathlib import Path
 import sys
 
+from fprime_gds.common.fpy.backend import ir_to_bytecode
+from fprime_gds.common.fpy.backend_types import deserialize_directives, serialize_directives
 import fprime_gds.common.fpy.error
-from fprime_gds.common.fpy.types import deserialize_directives, serialize_directives
 import fprime_gds.common.fpy.model 
 from fprime_gds.common.fpy.model import DirectiveErrorCode, FpySequencerModel
-from fprime_gds.common.fpy.parser import parse
-from fprime_gds.common.fpy.codegen import compile
+from fprime_gds.common.fpy.syntax import text_to_ast
+from fprime_gds.common.fpy.semantics import ast_to_ir
 
 def human_readable_size(size_bytes):
     units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
@@ -56,11 +57,21 @@ def compile_main(args: list[str]=None):
         sys.exit(-1)
 
     fprime_gds.common.fpy.error.file_name = str(args.input)
-    body = parse(args.input.read_text())
-    directives = compile(body, args.dictionary)
-    if isinstance(directives, fprime_gds.common.fpy.error.CompileError):
+
+    # syntax
+    body = text_to_ast(args.input.read_text())
+    # semantics
+    module = ast_to_ir(body, args.dictionary)
+    if isinstance(module, fprime_gds.common.fpy.error.FrontendError):
+        print(module) # modules is an error
+        sys.exit(1)
+
+    # backend
+    directives = ir_to_bytecode(module)
+    if isinstance(directives, fprime_gds.common.fpy.error.BackendError):
         print(directives) # directives is an error
         sys.exit(1)
+
     output = args.output
     if output is None:
         output = args.input.with_suffix(".bin")

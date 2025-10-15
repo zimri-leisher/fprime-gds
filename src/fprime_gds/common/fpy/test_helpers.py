@@ -2,11 +2,11 @@ import ast
 from pathlib import Path
 import tempfile
 import traceback
-from fprime_gds.common.fpy.types import deserialize_directives, serialize_directives
+from fprime_gds.common.fpy.frontend_types import deserialize_directives, serialize_directives
 from fprime_gds.common.fpy.model import DirectiveErrorCode, FpySequencerModel
 from fprime_gds.common.fpy.bytecode.directives import Directive
 from fprime_gds.common.fpy.main import compile_main
-from fprime_gds.common.fpy.parser import parse
+from fprime_gds.common.fpy.syntax import text_to_ast
 from fprime_gds.common.loaders.ch_json_loader import ChJsonLoader
 from fprime_gds.common.loaders.cmd_json_loader import CmdJsonLoader
 from fprime_gds.common.loaders.event_json_loader import EventJsonLoader

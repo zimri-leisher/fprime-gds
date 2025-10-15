@@ -13,7 +13,7 @@ import fprime_gds.common.fpy.error
 fpy_grammar_str = (Path(__file__).parent / "grammar.lark").read_text()
 
 
-def parse(text: str):
+def text_to_ast(text: str):
     parser = Lark(
         fpy_grammar_str,
         start="input",

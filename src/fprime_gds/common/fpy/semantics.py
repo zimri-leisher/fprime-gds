@@ -9,8 +9,9 @@ import typing
 from typing import Union, get_origin, get_args
 import zlib
 
+from fprime_gds.common.fpy.ir import IrBasicBlock, IrFunction, IrModule
 from fprime_gds.common.fpy.model import DirectiveErrorCode
-from fprime_gds.common.fpy.types import (
+from fprime_gds.common.fpy.frontend_types import (
     SPECIFIC_FLOAT_TYPES,
     SPECIFIC_INTEGER_TYPES,
     MACROS,
@@ -20,7 +21,7 @@ from fprime_gds.common.fpy.types import (
     SIGNED_INTEGER_TYPES,
     UNSIGNED_INTEGER_TYPES,
     ArrayIndexType,
-    CompileState,
+    FrontendState,
     FieldReference,
     FppTypeClass,
     FpyCallable,
@@ -33,6 +34,7 @@ from fprime_gds.common.fpy.types import (
     InternalIntType,
     InternalStringType,
     NothingType,
+    NothingValue,
     TopDownVisitor,
     Visitor,
     convert_numeric_type,
@@ -42,7 +44,7 @@ from fprime_gds.common.fpy.types import (
     resolve_var,
 )
 
-from fprime_gds.common.fpy.error import CompileError
+from fprime_gds.common.fpy.error import FrontendError
 
 # In Python 3.10+, the `|` operator creates a `types.UnionType`.
 # We need to handle this for forward compatibility, but it won't exist in 3.9.
@@ -125,7 +127,7 @@ from fprime.common.models.serialize.numerical_types import (
 )
 from fprime.common.models.serialize.string_type import StringType
 from fprime.common.models.serialize.bool_type import BoolType
-from fprime_gds.common.fpy.parser import (
+from fprime_gds.common.fpy.syntax import (
     AstAssert,
     AstBinaryOp,
     AstBoolean,
@@ -169,13 +171,13 @@ class SetLocalScope(Visitor):
     def __init__(self, scope: FpyScope):
         self.scope = scope
 
-    def visit_default(self, node: Ast, state: CompileState):
+    def visit_default(self, node: Ast, state: FrontendState):
         state.local_scopes[node] = self.scope
 
 
 class AssignLocalScopes(TopDownVisitor):
 
-    def visit_AstScopedBody(self, node: AstScopedBody, state: CompileState):
+    def visit_AstScopedBody(self, node: AstScopedBody, state: FrontendState):
         parent_scope = state.local_scopes.get(node)
         # make a new scope
         scope = FpyScope()
@@ -187,7 +189,7 @@ class AssignLocalScopes(TopDownVisitor):
 class CreateVariables(TopDownVisitor):
     """finds all variable declarations and adds them to the variable scope"""
 
-    def visit_AstAssign(self, node: AstAssign, state: CompileState):
+    def visit_AstAssign(self, node: AstAssign, state: FrontendState):
         if not isinstance(node.lhs, AstReference):
             state.err("Invalid assignment", node.lhs)
             return
@@ -225,7 +227,7 @@ class CreateVariables(TopDownVisitor):
                 state.err("Cannot specify a type annotation for a field", node.type_ann)
                 return
 
-    def visit_AstFor(self, node: AstFor, state: CompileState):
+    def visit_AstFor(self, node: AstFor, state: FrontendState):
         # for loops have an implicit loop variable that they declare inside of their scoped body
         existing = state.local_scopes[node.body].get(node.loop_var.var)
 
@@ -246,7 +248,7 @@ class CheckUseBeforeDeclare(Visitor):
     def __init__(self):
         self.currently_declared_vars: list[FpyVariable] = []
 
-    def visit_AstAssign(self, node: AstAssign, state: CompileState):
+    def visit_AstAssign(self, node: AstAssign, state: FrontendState):
         if not isinstance(node.lhs, AstVar):
             # definitely not a declaration, it's a field assignment
             return
@@ -261,7 +263,7 @@ class CheckUseBeforeDeclare(Visitor):
 
         self.currently_declared_vars.append(var)
 
-    def visit_AstVar(self, node: AstVar, state: CompileState):
+    def visit_AstVar(self, node: AstVar, state: FrontendState):
         ref = state.local_scopes[node].get(node.var)
         if ref is None:
             # not a variable, otherwise it would be in scope. might be a type name or smth
@@ -284,12 +286,12 @@ class CheckUseBeforeDeclareLoopVar(TopDownVisitor):
     def __init__(self):
         self.currently_declared_vars: list[FpyVariable] = []
 
-    def visit_AstFor(self, node: AstFor, state: CompileState):
+    def visit_AstFor(self, node: AstFor, state: FrontendState):
         var = state.local_scopes[node.body][node.loop_var.var]
 
         self.currently_declared_vars.append(var)
 
-    def visit_AstVar(self, node: AstVar, state: CompileState):
+    def visit_AstVar(self, node: AstVar, state: FrontendState):
         ref = state.local_scopes[node].get(node.var)
         if ref is None:
             # not a variable, otherwise it would be in scope. might be a type name or smth
@@ -309,7 +311,7 @@ class CheckUseBeforeDeclareLoopVar(TopDownVisitor):
 
 class ResolveVarsAndTypes(TopDownVisitor):
 
-    def resolve_type_reference(self, node: Ast, state: CompileState) -> bool:
+    def resolve_type_reference(self, node: Ast, state: FrontendState) -> bool:
 
         # we have some special logic for types because we want them resolved early,
         # and they are easy to resolve
@@ -349,7 +351,7 @@ class ResolveVarsAndTypes(TopDownVisitor):
         node: Ast,
         global_scope: FpyScope,
         global_scope_name: str,
-        state: CompileState,
+        state: FrontendState,
     ) -> bool:
         if not isinstance(node, AstReference):
             return True
@@ -377,7 +379,7 @@ class ResolveVarsAndTypes(TopDownVisitor):
         state.resolved_references[node] = resolved
         return True
 
-    def visit_AstFuncCall(self, node: AstFuncCall, state: CompileState):
+    def visit_AstFuncCall(self, node: AstFuncCall, state: FrontendState):
         if not self.resolve_var_in_global_scope(
             node.func, state.callables, "callable", state
         ):
@@ -390,14 +392,14 @@ class ResolveVarsAndTypes(TopDownVisitor):
             ):
                 return
 
-    def visit_AstIf_AstElif(self, node: Union[AstIf, AstElif], state: CompileState):
+    def visit_AstIf_AstElif(self, node: Union[AstIf, AstElif], state: FrontendState):
         # if condition expr refs must be "runtime values" (tlm/prm/const/etc)
         if not self.resolve_var_in_global_scope(
             node.condition, state.runtime_values, "value", state
         ):
             return
 
-    def visit_AstBinaryOp(self, node: AstBinaryOp, state: CompileState):
+    def visit_AstBinaryOp(self, node: AstBinaryOp, state: FrontendState):
         # lhs/rhs side of stack op, if they are refs, must be refs to "runtime vals"
         if not self.resolve_var_in_global_scope(
             node.lhs, state.runtime_values, "value", state
@@ -408,13 +410,13 @@ class ResolveVarsAndTypes(TopDownVisitor):
         ):
             return
 
-    def visit_AstUnaryOp(self, node: AstUnaryOp, state: CompileState):
+    def visit_AstUnaryOp(self, node: AstUnaryOp, state: FrontendState):
         if not self.resolve_var_in_global_scope(
             node.val, state.runtime_values, "value", state
         ):
             return
 
-    def visit_AstAssign(self, node: AstAssign, state: CompileState):
+    def visit_AstAssign(self, node: AstAssign, state: FrontendState):
         if not self.resolve_var_in_global_scope(
             node.lhs, state.runtime_values, "value", state
         ):
@@ -437,7 +439,7 @@ class ResolveVarsAndTypes(TopDownVisitor):
         ):
             return
 
-    def visit_AstFor(self, node: AstFor, state: CompileState):
+    def visit_AstFor(self, node: AstFor, state: FrontendState):
         if not self.resolve_var_in_global_scope(
             node.loop_var, state.runtime_values, "value", state
         ):
@@ -465,13 +467,13 @@ class ResolveVarsAndTypes(TopDownVisitor):
         ):
             return
 
-    def visit_AstWhile(self, node: AstWhile, state: CompileState):
+    def visit_AstWhile(self, node: AstWhile, state: FrontendState):
         if not self.resolve_var_in_global_scope(
             node.condition, state.runtime_values, "value", state
         ):
             return
 
-    def visit_AstAssert(self, node: AstAssert, state: CompileState):
+    def visit_AstAssert(self, node: AstAssert, state: FrontendState):
         if not self.resolve_var_in_global_scope(
             node.condition, state.runtime_values, "value", state
         ):
@@ -482,21 +484,21 @@ class ResolveVarsAndTypes(TopDownVisitor):
             ):
                 return
 
-    def visit_AstVar(self, node: AstVar, state: CompileState):
+    def visit_AstVar(self, node: AstVar, state: FrontendState):
         # make sure that all vars are resolved when we get to them
         # if not resolved, then the var is "outside" of a context which could resolve it
         if node not in state.resolved_references:
             state.err("Expression is invalid when used here", node)
             return
 
-    def visit_AstGetItem(self, node: AstGetItem, state: CompileState):
+    def visit_AstGetItem(self, node: AstGetItem, state: FrontendState):
         if not self.resolve_var_in_global_scope(
             node.item, state.runtime_values, "value", state
         ):
             return
 
     def visit_AstLiteral_AstGetAttr(
-        self, node: Union[AstLiteral, AstGetAttr], state: CompileState
+        self, node: Union[AstLiteral, AstGetAttr], state: FrontendState
     ):
         # don't need to do anything for literals or getattr, but just have this here for completion's sake
         pass
@@ -509,7 +511,7 @@ class ResolveVarsAndTypes(TopDownVisitor):
 class PickTypesAndResolveAttrsAndItems(Visitor):
 
     def coerce_expr_type(
-        self, node: AstExpr, type: FppTypeClass, state: CompileState
+        self, node: AstExpr, type: FppTypeClass, state: FrontendState
     ) -> bool:
         unconverted_type = state.expr_unconverted_types[node]
         if self.can_coerce_type(unconverted_type, type):
@@ -588,7 +590,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         return True
 
     def get_members(
-        self, node: Ast, parent_type: FppTypeClass, state: CompileState
+        self, node: Ast, parent_type: FppTypeClass, state: FrontendState
     ) -> list[tuple[str, FppTypeClass]] | None:
         if not issubclass(parent_type, (StructType, TimeType)):
             return {}
@@ -612,7 +614,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
             member_list.append(("useconds", U32Type))
         return member_list
 
-    def visit_AstGetAttr(self, node: AstGetAttr, state: CompileState):
+    def visit_AstGetAttr(self, node: AstGetAttr, state: FrontendState):
         parent_ref = state.resolved_references.get(node.parent)
 
         if isinstance(parent_ref, (type, FpyCallable)):
@@ -683,7 +685,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         state.expr_unconverted_types[node] = ref_type
         state.expr_converted_types[node] = ref_type
 
-    def visit_AstGetItem(self, node: AstGetItem, state: CompileState):
+    def visit_AstGetItem(self, node: AstGetItem, state: FrontendState):
         parent_ref = state.resolved_references.get(node.parent)
 
         if isinstance(parent_ref, (type, FpyCallable, dict)):
@@ -727,7 +729,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         state.expr_unconverted_types[node] = parent_type.MEMBER_TYPE
         state.expr_converted_types[node] = parent_type.MEMBER_TYPE
 
-    def visit_AstVar(self, node: AstVar, state: CompileState):
+    def visit_AstVar(self, node: AstVar, state: FrontendState):
         # already been resolved by SetScopes pass
         ref = state.resolved_references[node]
         if ref is None:
@@ -737,7 +739,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         state.expr_unconverted_types[node] = ref_type
         state.expr_converted_types[node] = ref_type
 
-    def visit_AstNumber(self, node: AstNumber, state: CompileState):
+    def visit_AstNumber(self, node: AstNumber, state: FrontendState):
         # give a best guess as to the final type of this node. we don't actually know
         # its bitwidth or signedness yet
         if isinstance(node.value, float):
@@ -748,7 +750,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         state.expr_unconverted_types[node] = result_type
         state.expr_converted_types[node] = result_type
 
-    def visit_AstBinaryOp(self, node: AstBinaryOp, state: CompileState):
+    def visit_AstBinaryOp(self, node: AstBinaryOp, state: FrontendState):
         lhs_type = state.expr_unconverted_types[node.lhs]
         rhs_type = state.expr_unconverted_types[node.rhs]
 
@@ -786,7 +788,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         state.expr_unconverted_types[node] = result_type
         state.expr_converted_types[node] = result_type
 
-    def visit_AstUnaryOp(self, node: AstUnaryOp, state: CompileState):
+    def visit_AstUnaryOp(self, node: AstUnaryOp, state: FrontendState):
         val_type = state.expr_unconverted_types[node.val]
 
         intermediate_type = self.pick_intermediate_type([val_type], node.op)
@@ -812,15 +814,15 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         state.expr_unconverted_types[node] = result_type
         state.expr_converted_types[node] = result_type
 
-    def visit_AstString(self, node: AstString, state: CompileState):
+    def visit_AstString(self, node: AstString, state: FrontendState):
         state.expr_unconverted_types[node] = InternalStringType
         state.expr_converted_types[node] = InternalStringType
 
-    def visit_AstBoolean(self, node: AstBoolean, state: CompileState):
+    def visit_AstBoolean(self, node: AstBoolean, state: FrontendState):
         state.expr_unconverted_types[node] = BoolType
         state.expr_converted_types[node] = BoolType
 
-    def visit_AstFuncCall(self, node: AstFuncCall, state: CompileState):
+    def visit_AstFuncCall(self, node: AstFuncCall, state: FrontendState):
         func = state.resolved_references.get(node.func)
         if not isinstance(func, FpyCallable):
             state.err("Unknown function", node.func)
@@ -830,7 +832,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
 
         if len(node_args) < len(func_args):
             state.errors.append(
-                CompileError(
+                FrontendError(
                     f"Missing arguments (expected {len(func_args)} found {len(node_args)})",
                     node,
                 )
@@ -838,7 +840,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
             return
         if len(node_args) > len(func_args):
             state.errors.append(
-                CompileError(
+                FrontendError(
                     f"Too many arguments (expected {len(func_args)} found {len(node_args)})",
                     node,
                 )
@@ -855,7 +857,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         state.expr_unconverted_types[node] = func.return_type
         state.expr_converted_types[node] = func.return_type
 
-    def visit_AstAssign(self, node: AstAssign, state: CompileState):
+    def visit_AstAssign(self, node: AstAssign, state: FrontendState):
         # should be present in resolved refs because we only let it through if
         # variable is attr, item or var
         lhs_ref = state.resolved_references[node.lhs]
@@ -884,14 +886,14 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         if not self.coerce_expr_type(node.rhs, lhs_type, state):
             return
 
-    def visit_AstAssert(self, node: AstAssert, state: CompileState):
+    def visit_AstAssert(self, node: AstAssert, state: FrontendState):
         if not self.coerce_expr_type(node.condition, BoolType, state):
             return
         if node.exit_code is not None:
             if not self.coerce_expr_type(node.exit_code, U8Type, state):
                 return
 
-    def visit_AstFor(self, node: AstFor, state: CompileState):
+    def visit_AstFor(self, node: AstFor, state: FrontendState):
         # okay we have three types, but lb gets converted to lv, so we just have lv and ub
         # so we're going to be comparing lv to ub type, so find an intermediate
     
@@ -931,11 +933,11 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         # handle increment loop var
         # don't have to handle it i think actually. TODO show why
 
-    def visit_AstWhile(self, node: AstWhile, state: CompileState):
+    def visit_AstWhile(self, node: AstWhile, state: FrontendState):
         if not self.coerce_expr_type(node.condition, BoolType, state):
             return
 
-    def visit_AstIf_AstElif(self, node: Union[AstIf, AstElif], state: CompileState):
+    def visit_AstIf_AstElif(self, node: Union[AstIf, AstElif], state: FrontendState):
         if not self.coerce_expr_type(node.condition, BoolType, state):
             return
 
@@ -945,7 +947,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
 
 
 class AllocateVariables(Visitor):
-    def visit_AstAssign(self, node: AstAssign, state: CompileState):
+    def visit_AstAssign(self, node: AstAssign, state: FrontendState):
         lhs_ref = state.resolved_references[node.lhs]
         if not isinstance(lhs_ref, FpyVariable):
             # it's a field ref, ignore it. don't need any more space for it
@@ -962,7 +964,7 @@ class AllocateVariables(Visitor):
             state.lvar_array_size_bytes += value_size
             lhs_ref.lvar_offset = lvar_offset
 
-    def visit_AstFor(self, node: AstFor, state: CompileState):
+    def visit_AstFor(self, node: AstFor, state: FrontendState):
         # allocate space for the loop var
         loop_var_ref = state.resolved_references[node.loop_var]
         assert isinstance(loop_var_ref, FpyVariable)
@@ -986,7 +988,7 @@ class CalculateConstExprValues(Visitor):
     calculated at compile time, and NothingType if the expr had no value"""
 
     def const_coerce_type(
-        self, from_val: FppType, to_type: FppTypeClass, node: Ast, state: CompileState
+        self, from_val: FppType, to_type: FppTypeClass, node: Ast, state: FrontendState
     ) -> FppType | None:
         try:
             if type(from_val) == to_type:
@@ -1005,7 +1007,7 @@ class CalculateConstExprValues(Visitor):
             state.err(f"For type {type(from_val).__name__}: {e}", node)
             return None
 
-    def visit_AstLiteral(self, node: AstLiteral, state: CompileState):
+    def visit_AstLiteral(self, node: AstLiteral, state: FrontendState):
         uncoerced_type = state.expr_unconverted_types[node]
 
         try:
@@ -1022,7 +1024,7 @@ class CalculateConstExprValues(Visitor):
 
         state.expr_converted_values[node] = expr_value
 
-    def visit_AstGetAttr(self, node: AstGetAttr, state: CompileState):
+    def visit_AstGetAttr(self, node: AstGetAttr, state: FrontendState):
 
         unconverted_type = state.expr_unconverted_types[node]
         converted_type = state.expr_converted_types[node]
@@ -1030,7 +1032,7 @@ class CalculateConstExprValues(Visitor):
         expr_value = None
         if isinstance(ref, (type, dict, FpyCallable)):
             # these types have no value
-            state.expr_converted_values[node] = NothingType()
+            state.expr_converted_values[node] = NothingValue()
             assert unconverted_type == converted_type, (
                 unconverted_type,
                 converted_type,
@@ -1077,7 +1079,7 @@ class CalculateConstExprValues(Visitor):
                 return
         state.expr_converted_values[node] = expr_value
 
-    def visit_AstGetItem(self, node: AstGetItem, state: CompileState):
+    def visit_AstGetItem(self, node: AstGetItem, state: FrontendState):
         ref = state.resolved_references[node]
         # get item can only be a field reference
         assert isinstance(ref, FieldReference), ref
@@ -1111,14 +1113,14 @@ class CalculateConstExprValues(Visitor):
                 return
         state.expr_converted_values[node] = expr_value
 
-    def visit_AstVar(self, node: AstVar, state: CompileState):
+    def visit_AstVar(self, node: AstVar, state: FrontendState):
         unconverted_type = state.expr_unconverted_types[node]
         converted_type = state.expr_converted_types[node]
         ref = state.resolved_references[node]
         expr_value = None
         if isinstance(ref, (type, dict, FpyCallable)):
             # these types have no value
-            state.expr_converted_values[node] = NothingType()
+            state.expr_converted_values[node] = NothingValue()
             assert unconverted_type == converted_type, (
                 unconverted_type,
                 converted_type,
@@ -1143,7 +1145,7 @@ class CalculateConstExprValues(Visitor):
                 return
         state.expr_converted_values[node] = expr_value
 
-    def visit_AstFuncCall(self, node: AstFuncCall, state: CompileState):
+    def visit_AstFuncCall(self, node: AstFuncCall, state: FrontendState):
         func = state.resolved_references[node.func]
         assert isinstance(func, FpyCallable)
         # gather arg values
@@ -1197,7 +1199,7 @@ class CalculateConstExprValues(Visitor):
 
         state.expr_converted_values[node] = expr_value
 
-    def visit_AstOp(self, node: AstOp, state: CompileState):
+    def visit_AstOp(self, node: AstOp, state: FrontendState):
         # we do not calculate compile time value of operators at the moment
         state.expr_converted_values[node] = None
 
@@ -1205,12 +1207,11 @@ class CalculateConstExprValues(Visitor):
         # coding error, missed an expr
         assert not is_instance_compat(node, AstExpr), node
 
-
 class GenerateConstExprDirectives(Visitor):
     """for each expr with a constant compile time value, generate
     directives for how to put it in its register"""
 
-    def visit_AstExpr(self, node: AstExpr, state: CompileState):
+    def visit_AstExpr(self, node: AstExpr, state: FrontendState):
         if node in state.directives:
             # already have directives associated with this node
             return
@@ -1229,7 +1230,7 @@ class GenerateConstExprDirectives(Visitor):
             expr_type,
         )
 
-        if isinstance(expr_value, NothingType):
+        if isinstance(expr_value, NothingValue):
             # nothing type has no value
             state.directives[node] = []
             return
@@ -1250,7 +1251,7 @@ class GenerateExprMacrosAndCmds(Visitor):
     generate directives to calculate the value and put it in its register. for each command
     or macro, generate directives for calling them with appropriate arg values"""
 
-    def visit_AstGetItem(self, node: AstGetItem, state: CompileState):
+    def visit_AstGetItem(self, node: AstGetItem, state: FrontendState):
         if node in state.directives:
             # already know how to put it on stack, or it is impossible
             return
@@ -1326,7 +1327,7 @@ class GenerateExprMacrosAndCmds(Visitor):
 
         state.directives[node] = directives
 
-    def visit_AstVar(self, node: AstVar, state: CompileState):
+    def visit_AstVar(self, node: AstVar, state: FrontendState):
         if node in state.directives:
             # already know how to put it on stack, or it is impossible
             return
@@ -1345,7 +1346,7 @@ class GenerateExprMacrosAndCmds(Visitor):
 
         state.directives[node] = directives
 
-    def visit_AstGetAttr(self, node: AstGetAttr, state: CompileState):
+    def visit_AstGetAttr(self, node: AstGetAttr, state: FrontendState):
         if node in state.directives:
             # already know how to put it on stack, or it is impossible
             return
@@ -1395,7 +1396,7 @@ class GenerateExprMacrosAndCmds(Visitor):
 
         state.directives[node] = directives
 
-    def visit_AstBinaryOp(self, node: AstBinaryOp, state: CompileState):
+    def visit_AstBinaryOp(self, node: AstBinaryOp, state: FrontendState):
         if node in state.directives:
             # already know how to put it on stack
             return
@@ -1431,7 +1432,7 @@ class GenerateExprMacrosAndCmds(Visitor):
 
         state.directives[node] = directives
 
-    def visit_AstUnaryOp(self, node: AstUnaryOp, state: CompileState):
+    def visit_AstUnaryOp(self, node: AstUnaryOp, state: FrontendState):
         if node in state.directives:
             # already know how to put it on stack
             return
@@ -1461,7 +1462,7 @@ class GenerateExprMacrosAndCmds(Visitor):
 
         state.directives[node] = directives
 
-    def visit_AstFuncCall(self, node: AstFuncCall, state: CompileState):
+    def visit_AstFuncCall(self, node: AstFuncCall, state: FrontendState):
         if node in state.directives:
             # already know how to put it on stack
             return
@@ -1515,7 +1516,7 @@ class GenerateExprMacrosAndCmds(Visitor):
             directives.extend(convert_numeric_type(unconverted_type, converted_type))
         state.directives[node] = directives
 
-    def visit_AstAssign(self, node: AstAssign, state: CompileState):
+    def visit_AstAssign(self, node: AstAssign, state: FrontendState):
         if node in state.directives:
             # already know how to do this assign
             return
@@ -1613,7 +1614,7 @@ class GenerateExprMacrosAndCmds(Visitor):
 
         state.directives[node] = directives
 
-    def visit_AstAssert(self, node: AstAssert, state: CompileState):
+    def visit_AstAssert(self, node: AstAssert, state: FrontendState):
         directives = state.directives[node.condition]
         # push the error code we should use if false, if one was given
         if node.exit_code is not None:
@@ -1629,153 +1630,13 @@ class GenerateExprMacrosAndCmds(Visitor):
 
         state.directives[node] = directives
 
-    def visit_AstFor(self, node: AstFor, state: CompileState):
+    def visit_AstFor(self, node: AstFor, state: FrontendState):
         # convert the lower bound into the intermediate type
         pass
 
 
-class CountNodeDirectives(Visitor):
-    """count the number of directives that will be generated by each node"""
-
-    def visit_AstIf(self, node: AstIf, state: CompileState):
-        count = 0
-        # include the condition
-        count += state.node_dir_counts[node.condition]
-        # include if stmt
-        count += 1
-        # include body
-        count += state.node_dir_counts[node.body]
-        # include a goto end of if
-        count += 1
-
-        if node.elifs is not None:
-            count += state.node_dir_counts[node.elifs]
-        if node.els is not None:
-            count += state.node_dir_counts[node.els]
-
-        state.node_dir_counts[node] = count
-
-    def visit_AstElifs(self, node: AstElifs, state: CompileState):
-        count = 0
-        for case in node.cases:
-            count += state.node_dir_counts[case]
-
-        state.node_dir_counts[node] = count
-
-    def visit_AstElif(self, node: AstElif, state: CompileState):
-        count = 0
-        # include the condition
-        count += state.node_dir_counts[node.condition]
-        # include if stmt
-        count += 1
-        # include body
-        count += state.node_dir_counts[node.body]
-        # include a goto end of if
-        count += 1
-
-        state.node_dir_counts[node] = count
-
-    def visit_AstFor(self, node: AstFor, state: CompileState):
-        count = 0
-        # include upper bound push
-        count += state.node_dir_counts[node.upper_bound]
-        # include push val and store ub
-        count += 2
-
-        # include lb push
-        count += state.node_dir_counts[node.lower_bound]
-        # include push val and store lb
-        count += 2
-        # include end of loop check: load lv, load ub, cmp, if
-        count += 4
-        # include body
-        count += state.node_dir_counts[node.body]
-        # include increment lv: load lv, push 1, add, push lvar offset, store
-        count += 5
-        # include goto loop check
-        count += 1
-
-        state.node_dir_counts[node] = count
-
-    def visit_AstBody(self, node: Union[AstBody, AstScopedBody], state: CompileState):
-        count = 0
-        if (
-            isinstance(node, AstScopedBody)
-            and state.scope_parents[state.local_scopes[node]] is None
-        ):
-            # only for the first scoped body:
-            # add one for lvar array alloc
-            count += 1
-        for stmt in node.stmts:
-            count += state.node_dir_counts[stmt]
-
-        state.node_dir_counts[node] = count
-
-    def visit_default(self, node, state):
-        state.node_dir_counts[node] = (
-            len(state.directives[node]) if state.directives.get(node) is not None else 0
-        )
-
-
-class CalculateStartLineIdx(TopDownVisitor):
-    """based on the number of directives generated by each node, calculate the start line idx
-    of each node's directives"""
-
-    def visit_AstBody(self, node: Union[AstBody, AstScopedBody], state: CompileState):
-        if node not in state.start_line_idx:
-            state.start_line_idx[node] = 0
-
-        start_idx = state.start_line_idx[node]
-
-        line_idx = start_idx
-        if isinstance(node, AstScopedBody):
-            # include lvar alloc
-            line_idx += 1
-
-        for stmt in node.stmts:
-            state.start_line_idx[stmt] = line_idx
-            line_idx += state.node_dir_counts[stmt]
-
-    def visit_AstIf(self, node: AstIf, state: CompileState):
-        line_idx = state.start_line_idx[node]
-        state.start_line_idx[node.condition] = line_idx
-        line_idx += state.node_dir_counts[node.condition]
-        # include if stmt
-        line_idx += 1
-        state.start_line_idx[node.body] = line_idx
-        line_idx += state.node_dir_counts[node.body]
-        # include goto stmt
-        line_idx += 1
-        if node.elifs is not None:
-            state.start_line_idx[node.elifs] = line_idx
-            line_idx += state.node_dir_counts[node.elifs]
-        if node.els is not None:
-            state.start_line_idx[node.els] = line_idx
-            line_idx += state.node_dir_counts[node.els]
-
-    def visit_AstElifs(self, node: AstElifs, state: CompileState):
-        line_idx = state.start_line_idx[node]
-        for case in node.cases:
-            state.start_line_idx[case] = line_idx
-            line_idx += state.node_dir_counts[case]
-
-    def visit_AstElif(self, node: AstElif, state: CompileState):
-        line_idx = state.start_line_idx[node]
-        state.start_line_idx[node.condition] = line_idx
-        line_idx += state.node_dir_counts[node.condition]
-        # include if dir
-        line_idx += 1
-        state.start_line_idx[node.body] = line_idx
-        line_idx += state.node_dir_counts[node.body]
-        # include a goto end of if
-        line_idx += 1
-
-
-class GenerateBodyDirectives(Visitor):
-    """concatenate all directives together for each AstBody"""
-
-    def visit_AstIf(self, node: AstIf, state: CompileState):
-        start_line_idx = state.start_line_idx[node]
+class GenerateIrBlocks(Visitor):
+    def visit_AstIf(self, node: AstIf, state: FrontendState):
 
         all_dirs = []
 
@@ -1818,7 +1679,7 @@ class GenerateBodyDirectives(Visitor):
 
         state.directives[node] = all_dirs
 
-    def visit_AstFor(self, node: AstFor, state: CompileState):
+    def visit_AstFor(self, node: AstFor, state: FrontendState):
         start_line_idx = state.start_line_idx[node]
         # we need to do a few things:
         # 1. initialize the loop var, and store the lower bound in it
@@ -1912,7 +1773,7 @@ class GenerateBodyDirectives(Visitor):
 
         state.directives[node] = dirs
 
-    def visit_AstBody(self, node: Union[AstBody, AstScopedBody], state: CompileState):
+    def visit_AstBody(self, node: Union[AstBody, AstScopedBody], state: FrontendState):
         dirs = []
         if (
             isinstance(node, AstScopedBody)
@@ -1928,7 +1789,43 @@ class GenerateBodyDirectives(Visitor):
         state.directives[node] = dirs
 
 
-def get_base_compile_state(dictionary: str) -> CompileState:
+class GenerateIrBasicBlocks(Visitor):
+
+    def __init__(self):
+        self.block: IrBasicBlock = None
+
+    def visit_default(self, node, state):
+        dirs = state.stmt_directives.get(node)
+        if dirs is None:
+            # don't generate any directives for this node
+            return
+        self.block.stmts.append()
+
+    def visit_AstIf(self, node: AstIf, state: FrontendState):
+        # use the unique node id in the name of the blocks
+        # the "then" block is the one that gets executed if the condition is true
+        # one possible predecessor: the current basic block
+        then_block = IrBasicBlock(f"{node.id}.then", [], [], [self.block])
+        # the merge block is the code that gets executed after the if condition
+        # several possible predecessors: the "then" block, the elif blocks, or the else block
+        # start by just including the "then" block
+        merge_block = IrBasicBlock(f"{node.id}.merge", [], [], [then_block])
+
+        else_block = None
+        if node.els is not None:
+            else_block = IrBasicBlock(f"{node.id}.else", [], [], [self.block])
+            merge_block.predecessors.append(else_block)
+
+        
+
+    def visit_AstElif(self, node: AstElif, state: FrontendState):
+        then_block = IrBasicBlock(f"{node.id}.then", [], [], [self.block])
+        merge_block = IrBasicBlock(f"{node.id}.merge", [], [], [then_block, self.block])
+
+
+
+
+def get_base_compile_state(dictionary: str) -> FrontendState:
     """return the initial state of the compiler, based on the given dict path"""
     cmd_json_dict_loader = CmdJsonLoader(dictionary)
     (cmd_id_dict, cmd_name_dict, versions) = cmd_json_dict_loader.construct_dicts(
@@ -2009,7 +1906,7 @@ def get_base_compile_state(dictionary: str) -> CompileState:
     for macro_name, macro in MACROS.items():
         callable_name_dict[macro_name] = macro
 
-    state = CompileState(
+    state = FrontendState(
         tlms=create_scope(ch_name_dict),
         prms=create_scope(prm_name_dict),
         types=create_scope(type_name_dict),
@@ -2019,7 +1916,7 @@ def get_base_compile_state(dictionary: str) -> CompileState:
     return state
 
 
-def compile(body: AstScopedBody, dictionary: str) -> list[Directive] | CompileError:
+def ast_to_ir(body: AstScopedBody, dictionary: str) -> IrModule | FrontendError:
     state = get_base_compile_state(dictionary)
     passes: list[Visitor] = [
         AssignIds(),
@@ -2058,13 +1955,9 @@ def compile(body: AstScopedBody, dictionary: str) -> list[Directive] | CompileEr
         if len(state.errors) != 0:
             return state.errors[0]
 
-    dirs = state.directives[body]
-    if len(dirs) > MAX_DIRECTIVES_COUNT:
-        err = CompileError(
-            f"Too many directives in sequence (expected less than {MAX_DIRECTIVES_COUNT}, had {len(dirs)})"
-        )
-        return err
+    basic_blocks = state.basic_blocks[body]
+    # right now, only one function: implicit main
+    func = IrFunction({}, NothingType, basic_blocks)
+    mod = IrModule([func])
 
-    # TODO check lvar array not > max stack size (AND TEST THIS!)
-
-    return dirs
+    return mod

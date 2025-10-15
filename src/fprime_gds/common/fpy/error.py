@@ -21,7 +21,7 @@ COMPILER_ERROR_CONTEXT_LINE_COUNT = 1
 
 
 @dataclass
-class CompileError:
+class FrontendError:
     msg: str
     node: Any = None
 
@@ -83,10 +83,14 @@ class CompileError:
         return result
 
 
+@dataclass
+class BackendError:
+    msg: str
+
 def handle_lark_error(err):
     assert isinstance(err, LarkError), err
     if isinstance(err, UnexpectedToken):
-        print(str(CompileError("Invalid syntax", err.token)))
+        print(str(FrontendError("Invalid syntax", err.token)))
     elif isinstance(err, DedentError):
-        print(str(CompileError(err.args[0])))
+        print(str(FrontendError(err.args[0])))
     exit(1)
