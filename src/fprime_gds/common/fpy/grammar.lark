@@ -27,7 +27,10 @@ elifs: elif_*
 elif_: "elif" _expr ":" body
 body: _NEWLINE _INDENT _stmt+ _DEDENT
 
-_expr: _test
+_expr: check_expr
+
+?check_expr: "check" _test ["timeout" _test ["persist" _test]] ["freq" _test]
+           | _test
 
 # logical tests
 _test: or_test
