@@ -103,11 +103,18 @@ class AstUnaryOp(Ast):
     op: str
     val: AstExpr
 
+@dataclass
+class AstCheck(Ast):
+    condition: AstExpr
+    timeout: Union[AstExpr, None]
+    persist: Union[AstExpr, None]
+    freq: Union[AstExpr, None]
+
 
 AstOp = Union[AstBinaryOp, AstUnaryOp]
 
 AstReference = Union[AstGetAttr, AstGetItem, AstVar]
-AstExpr = Union[AstFuncCall, AstLiteral, AstReference, AstOp]
+AstExpr = Union[AstFuncCall, AstLiteral, AstReference, AstOp, AstCheck]
 
 
 @dataclass
@@ -200,6 +207,8 @@ class FpyTransformer(Transformer):
     body = no_inline(AstBody)
     binary_op = AstBinaryOp
     unary_op = AstUnaryOp
+
+    check_expr = AstCheck
 
     func_call = AstFuncCall
     arguments = no_inline_or_meta(list)

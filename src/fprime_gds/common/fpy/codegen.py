@@ -119,6 +119,7 @@ from fprime.common.models.serialize.bool_type import BoolType
 from fprime_gds.common.fpy.parser import (
     AstBinaryOp,
     AstBoolean,
+    AstCheck,
     AstElif,
     AstElifs,
     AstExpr,
@@ -613,6 +614,22 @@ class PickAndConvertTypes(Visitor):
 
         if not self.coerce_expr_type(node.value, var_type, state):
             return
+
+    def visit_AstCheck(self, node: AstCheck, state: CompileState):
+        if not self.coerce_expr_type(node.condition, BoolType, state):
+            return
+
+        if node.timeout is not None:
+            if not self.coerce_expr_type(node.timeout, F64Type, state):
+                return
+        
+        if node.persist is not None:
+            if not self.coerce_expr_type(node.persist, F64Type, state):
+                return
+
+        if node.freq is not None:
+            if not self.coerce_expr_type(node.freq, F64Type, state):
+                return
 
     def visit_default(self, node, state):
         # coding error, missed an expr
