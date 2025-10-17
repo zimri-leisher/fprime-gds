@@ -1,131 +1,21 @@
-from fprime_gds.common.fpy.backend_types import BackendState
 from fprime_gds.common.fpy.bytecode.directives import (
     Directive,
     GotoDirective,
     IfDirective,
 )
 from fprime_gds.common.fpy.error import BackendError, FrontendError
-from fprime_gds.common.fpy.ir import (
+from fprime_gds.common.fpy.backend_types import (
+    BackendState,
     IrBasicBlock,
-    IrBinaryOp,
     IrDirective,
-    IrInst,
     IrFunction,
     IrGoto,
-    IrGotoLabel,
     IrIf,
     IrInstruction,
     IrModule,
     IrStmt,
     IrVisitor,
 )
-
-
-def get_64_bit_numeric_type(type: FppType) -> FppType:
-    assert type in SPECIFIC_NUMERIC_TYPES, type
-    return (
-        I64Type
-        if type in SIGNED_INTEGER_TYPES
-        else U64Type if type in UNSIGNED_INTEGER_TYPES else F64Type
-    )
-
-
-def convert_numeric_type(from_type: FppType, to_type: FppType) -> list[Directive]:
-    if from_type == to_type:
-        return []
-
-    # only valid runtime type conversion is between two numeric types
-    assert from_type in SPECIFIC_NUMERIC_TYPES and to_type in SPECIFIC_NUMERIC_TYPES, (
-        from_type,
-        to_type,
-    )
-    # also invalid to convert from a float to an integer at runtime due to loss of precision
-    assert not (
-        from_type in SPECIFIC_FLOAT_TYPES and to_type in SPECIFIC_INTEGER_TYPES
-    ), (
-        from_type,
-        to_type,
-    )
-
-    dirs = []
-    # first go to 64 bit width
-    dirs.extend(extend_numeric_type_to_64_bits(from_type))
-    from_64_bit = get_64_bit_numeric_type(from_type)
-    to_64_bit = get_64_bit_numeric_type(to_type)
-
-    # now convert from int to float if necessary
-    if from_64_bit == U64Type and to_64_bit == F64Type:
-        dirs.append(UnsignedIntToFloatDirective())
-        from_64_bit = F64Type
-    elif from_64_bit == I64Type and to_64_bit == F64Type:
-        dirs.append(SignedIntToFloatDirective())
-        from_64_bit = F64Type
-    elif from_64_bit == U64Type or from_64_bit == I64Type:
-        assert to_64_bit == U64Type or to_64_bit == I64Type
-        # conversion from signed to unsigned int is implicit, doesn't need code gen
-        from_64_bit = to_64_bit
-
-    assert from_64_bit == to_64_bit, (from_64_bit, to_64_bit)
-
-    # now truncate back down to desired size
-    dirs.extend(truncate_numeric_type_from_64_bits(to_64_bit, to_type.getMaxSize()))
-    return dirs
-
-
-def truncate_numeric_type_from_64_bits(
-    from_type: FppType, new_size: int
-) -> list[Directive]:
-
-    assert new_size in (1, 2, 4, 8), new_size
-    assert from_type.getMaxSize() == 8, from_type.getMaxSize()
-
-    if new_size == 8:
-        # already correct size
-        return []
-
-    if from_type == F64Type:
-        # only one option for float trunc
-        assert new_size == 4, new_size
-        return [FloatTruncateDirective()]
-
-    # must be an int
-    assert issubclass(from_type, IntegerType), from_type
-
-    if new_size == 1:
-        return [IntegerTruncate64To8Directive()]
-    elif new_size == 2:
-        return [IntegerTruncate64To16Directive()]
-
-    return [IntegerTruncate64To32Directive()]
-
-
-def extend_numeric_type_to_64_bits(type: FppType) -> list[Directive]:
-    if type.getMaxSize() == 8:
-        # already 8 bytes
-        return []
-    if type == F32Type:
-        return [FloatExtendDirective()]
-
-    # must be an int
-    assert issubclass(type, IntegerType), type
-
-    from_size = type.getMaxSize()
-    assert from_size in (1, 2, 4, 8), from_size
-
-    if type in SIGNED_INTEGER_TYPES:
-        if from_size == 1:
-            return [IntegerSignedExtend8To64Directive()]
-        elif from_size == 2:
-            return [IntegerSignedExtend16To64Directive()]
-        else:
-            return [IntegerSignedExtend32To64Directive()]
-    else:
-        if from_size == 1:
-            return [IntegerZeroExtend8To64Directive()]
-        elif from_size == 2:
-            return [IntegerZeroExtend16To64Directive()]
-        else:
-            return [IntegerZeroExtend32To64Directive()]
 
 
 class AssignIds(IrVisitor):
@@ -142,7 +32,11 @@ class CalculateLineNumbers(IrVisitor):
         self.next_line_idx = 0
 
     def visit_IrInstruction(
-        self, stmt: IrInstruction, block: IrBasicBlock, func: IrFunction, state: BackendState
+        self,
+        stmt: IrInstruction,
+        block: IrBasicBlock,
+        func: IrFunction,
+        state: BackendState,
     ):
         # each instr is guaranteed to map to exactly one dir
         state.dir_line_indices[stmt] = self.next_line_idx

@@ -2,38 +2,39 @@ from __future__ import annotations
 from abc import ABC
 import inspect
 from dataclasses import astuple, dataclass, field, fields
-from pathlib import Path
 import typing
-from typing import Union, get_args, get_origin
+from typing import Union
 from fprime_gds.common.fpy.error import FrontendError
-from fprime_gds.common.fpy.ir import IrBasicBlock, IrInstruction
-from typing import Iterable, Union, get_args, get_origin
-import zlib
+from fprime_gds.common.fpy.backend_types import IrBasicBlock, IrFunction
+from typing import Iterable, Union
 
-
-# In Python 3.10+, the `|` operator creates a `types.UnionType`.
-# We need to handle this for forward compatibility, but it won't exist in 3.9.
-try:
-    from types import UnionType
-
-    UNION_TYPES = (Union, UnionType)
-except ImportError:
-    UNION_TYPES = (Union,)
 
 from fprime_gds.common.fpy.bytecode.directives import (
+    FloatExtendDirective,
+    FloatTruncateDirective,
+    IntegerSignedExtend16To64Directive,
+    IntegerSignedExtend32To64Directive,
+    IntegerSignedExtend8To64Directive,
+    IntegerTruncate64To16Directive,
+    IntegerTruncate64To32Directive,
+    IntegerTruncate64To8Directive,
+    IntegerZeroExtend16To64Directive,
+    IntegerZeroExtend32To64Directive,
+    IntegerZeroExtend8To64Directive,
+    SignedIntToFloatDirective,
     StackOpDirective,
     FloatLogDirective,
     Directive,
     ExitDirective,
+    UnsignedIntToFloatDirective,
     WaitAbsDirective,
     WaitRelDirective,
 )
+from fprime_gds.common.fpy.util import is_instance_compat
 from fprime_gds.common.templates.ch_template import ChTemplate
 from fprime_gds.common.templates.cmd_template import CmdTemplate
 from fprime_gds.common.templates.prm_template import PrmTemplate
 from fprime.common.models.serialize.time_type import TimeType
-from fprime.common.models.serialize.serializable_type import SerializableType
-from fprime.common.models.serialize.array_type import ArrayType
 from fprime.common.models.serialize.numerical_types import (
     U32Type,
     U16Type,
@@ -48,7 +49,6 @@ from fprime.common.models.serialize.numerical_types import (
     IntegerType,
 )
 from fprime.common.models.serialize.string_type import StringType
-from fprime.common.models.serialize.bool_type import BoolType
 from fprime_gds.common.fpy.syntax import (
     AstBody,
     AstExpr,
@@ -135,27 +135,6 @@ SPECIFIC_FLOAT_TYPES = (
 
 ArrayIndexType = U64Type
 
-
-def is_instance_compat(obj, cls):
-    """
-    A wrapper for isinstance() that correctly handles Union types in Python 3.9+.
-
-    Args:
-        obj: The object to check.
-        cls: The class, tuple of classes, or Union type to check against.
-
-    Returns:
-        True if the object is an instance of the class or any type in the Union.
-    """
-    origin = get_origin(cls)
-    if origin in UNION_TYPES:
-        # It's a Union type, so get its arguments.
-        # e.g., get_args(Union[int, str]) returns (int, str)
-        return isinstance(obj, get_args(cls))
-
-    # It's not a Union, so it's a regular type (like int) or a
-    # tuple of types ((int, str)), which isinstance handles natively.
-    return isinstance(obj, cls)
 
 
 # a value of type FppType is a Python `type` object representing
@@ -250,31 +229,22 @@ class FpyVariable:
 
     type_ref: AstExpr
     """the expression denoting the var's type"""
-    declaration: AstAssign
+    declaration: AstAssign | AstFor
     """the node where this var is declared"""
     type: FppType | None = None
     """the resolved type of the variable. None if type unsure at the moment"""
     lvar_offset: int | None = None
     """the offset in the lvar array where this var is stored"""
 
+
 @dataclass
 class ForLoopAnalysis:
     loop_var: FpyVariable
-    loop_condition_lt_dir: type[StackOpDirective]
-    
+    upper_bound_var: FpyVariable
+    comparision_dir: type[Directive]
+    increment_dir: type[Directive]
+    intermediate_type: FppType
 
-    for_loop_upper_bound_variables: dict[AstFor, FpyVariable] = field(
-        default_factory=dict, repr=False
-    )
-    for_loop_comparison_directives: dict[AstFor, type[StackOpDirective]] = field(
-        default_factory=dict, repr=False
-    )
-    for_loop_increment_directives: dict[AstFor, type[StackOpDirective]] = field(
-        default_factory=dict, repr=False
-    )
-    for_loop_intermediate_type: dict[AstFor, FppTypeClass] = field(
-        default_factory=dict, repr=False
-    )
 
 # a scope
 next_scope_id = 0
@@ -423,6 +393,113 @@ def get_ref_fpp_type_class(ref: FpyReference) -> FppType:
     return result_type
 
 
+def get_64_bit_numeric_type(type: FppType) -> FppType:
+    assert type in SPECIFIC_NUMERIC_TYPES, type
+    return (
+        I64Type
+        if type in SIGNED_INTEGER_TYPES
+        else U64Type if type in UNSIGNED_INTEGER_TYPES else F64Type
+    )
+
+
+def convert_numeric_type(from_type: FppType, to_type: FppType) -> list[Directive]:
+    if from_type == to_type:
+        return []
+
+    # only valid runtime type conversion is between two numeric types
+    assert from_type in SPECIFIC_NUMERIC_TYPES and to_type in SPECIFIC_NUMERIC_TYPES, (
+        from_type,
+        to_type,
+    )
+    # also invalid to convert from a float to an integer at runtime due to loss of precision
+    assert not (
+        from_type in SPECIFIC_FLOAT_TYPES and to_type in SPECIFIC_INTEGER_TYPES
+    ), (
+        from_type,
+        to_type,
+    )
+
+    dirs = []
+    # first go to 64 bit width
+    dirs.extend(extend_numeric_type_to_64_bits(from_type))
+    from_64_bit = get_64_bit_numeric_type(from_type)
+    to_64_bit = get_64_bit_numeric_type(to_type)
+
+    # now convert from int to float if necessary
+    if from_64_bit == U64Type and to_64_bit == F64Type:
+        dirs.append(UnsignedIntToFloatDirective())
+        from_64_bit = F64Type
+    elif from_64_bit == I64Type and to_64_bit == F64Type:
+        dirs.append(SignedIntToFloatDirective())
+        from_64_bit = F64Type
+    elif from_64_bit == U64Type or from_64_bit == I64Type:
+        assert to_64_bit == U64Type or to_64_bit == I64Type
+        # conversion from signed to unsigned int is implicit, doesn't need code gen
+        from_64_bit = to_64_bit
+
+    assert from_64_bit == to_64_bit, (from_64_bit, to_64_bit)
+
+    # now truncate back down to desired size
+    dirs.extend(truncate_numeric_type_from_64_bits(to_64_bit, to_type.getMaxSize()))
+    return dirs
+
+
+def truncate_numeric_type_from_64_bits(
+    from_type: FppType, new_size: int
+) -> list[Directive]:
+
+    assert new_size in (1, 2, 4, 8), new_size
+    assert from_type.getMaxSize() == 8, from_type.getMaxSize()
+
+    if new_size == 8:
+        # already correct size
+        return []
+
+    if from_type == F64Type:
+        # only one option for float trunc
+        assert new_size == 4, new_size
+        return [FloatTruncateDirective()]
+
+    # must be an int
+    assert issubclass(from_type, IntegerType), from_type
+
+    if new_size == 1:
+        return [IntegerTruncate64To8Directive()]
+    elif new_size == 2:
+        return [IntegerTruncate64To16Directive()]
+
+    return [IntegerTruncate64To32Directive()]
+
+
+def extend_numeric_type_to_64_bits(type: FppType) -> list[Directive]:
+    if type.getMaxSize() == 8:
+        # already 8 bytes
+        return []
+    if type == F32Type:
+        return [FloatExtendDirective()]
+
+    # must be an int
+    assert issubclass(type, IntegerType), type
+
+    from_size = type.getMaxSize()
+    assert from_size in (1, 2, 4, 8), from_size
+
+    if type in SIGNED_INTEGER_TYPES:
+        if from_size == 1:
+            return [IntegerSignedExtend8To64Directive()]
+        elif from_size == 2:
+            return [IntegerSignedExtend16To64Directive()]
+        else:
+            return [IntegerSignedExtend32To64Directive()]
+    else:
+        if from_size == 1:
+            return [IntegerZeroExtend8To64Directive()]
+        elif from_size == 2:
+            return [IntegerZeroExtend16To64Directive()]
+        else:
+            return [IntegerZeroExtend32To64Directive()]
+
+
 def resolve_var(node: Ast, name: str, state: FrontendState) -> FpyVariable:
     # check this scope and all parent scopes
     local_scope = state.local_scopes[node]
@@ -459,26 +536,13 @@ class FrontendState:
         )
 
     root: AstScopedBody = None
+    main_func: IrFunction = None
     scope_parents: dict[AstScopedBody, AstScopedBody | None] = field(
         default_factory=dict, repr=False
     )
     body_scopes: dict[AstScopedBody, FpyScope] = field(default_factory=dict, repr=False)
     local_scopes: dict[Ast, FpyScope] = field(default_factory=dict, repr=False)
-    for_loop_variables: dict[AstFor, FpyVariable] = field(
-        default_factory=dict, repr=False
-    )
-    for_loop_upper_bound_variables: dict[AstFor, FpyVariable] = field(
-        default_factory=dict, repr=False
-    )
-    for_loop_comparison_directives: dict[AstFor, type[StackOpDirective]] = field(
-        default_factory=dict, repr=False
-    )
-    for_loop_increment_directives: dict[AstFor, type[StackOpDirective]] = field(
-        default_factory=dict, repr=False
-    )
-    for_loop_intermediate_type: dict[AstFor, FppType] = field(
-        default_factory=dict, repr=False
-    )
+    for_loops: dict[AstFor, ForLoopAnalysis] = field(default_factory=dict)
 
     resolved_references: dict[AstReference, FpyReference] = field(
         default_factory=dict, repr=False
@@ -509,7 +573,9 @@ class FrontendState:
 
     stmt_directives: dict[AstStmt, list[Directive] | None] = field(default_factory=dict)
 
-    basic_blocks: dict[Union[AstScopedBody, AstBody], IrBasicBlock] = field(default_factory=dict)
+    basic_blocks: dict[Union[AstScopedBody, AstBody], IrBasicBlock] = field(
+        default_factory=dict
+    )
 
     node_dir_counts: dict[Ast, int] = field(default_factory=dict)
     """node to the number of directives generated by it"""

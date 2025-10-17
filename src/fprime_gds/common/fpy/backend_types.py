@@ -1,79 +1,21 @@
 from __future__ import annotations
 from abc import ABC
 import inspect
-from dataclasses import astuple, dataclass, field, fields
-from pathlib import Path
+from dataclasses import astuple, dataclass, field
 import struct
-import traceback
 import typing
-from typing import Union, get_args, get_origin
+from typing import Union
 import zlib
 
-from fprime_gds.common.fpy.error import BackendError, FrontendError
-from fprime_gds.common.fpy.ir import IrBasicBlock, IrGoto, IrIf, IrInst, IrFunction, Ir, IrModule
-
-# In Python 3.10+, the `|` operator creates a `types.UnionType`.
-# We need to handle this for forward compatibility, but it won't exist in 3.9.
-try:
-    from types import UnionType
-
-    UNION_TYPES = (Union, UnionType)
-except ImportError:
-    UNION_TYPES = (Union,)
+from fprime_gds.common.fpy.error import BackendError
 
 from fprime_gds.common.fpy.bytecode.directives import (
-    FloatExtendDirective,
-    FloatTruncateDirective,
-    IntegerSignedExtend16To64Directive,
-    IntegerSignedExtend32To64Directive,
-    IntegerSignedExtend8To64Directive,
-    IntegerTruncate64To16Directive,
-    IntegerTruncate64To32Directive,
-    IntegerTruncate64To8Directive,
-    IntegerZeroExtend16To64Directive,
-    IntegerZeroExtend32To64Directive,
-    IntegerZeroExtend8To64Directive,
-    SignedIntToFloatDirective,
-    StackOpDirective,
-    FloatLogDirective,
     Directive,
-    ExitDirective,
-    UnsignedIntToFloatDirective,
-    WaitAbsDirective,
-    WaitRelDirective,
 )
-from fprime_gds.common.templates.ch_template import ChTemplate
-from fprime_gds.common.templates.cmd_template import CmdTemplate
-from fprime_gds.common.templates.prm_template import PrmTemplate
-from fprime.common.models.serialize.time_type import TimeType
-from fprime.common.models.serialize.serializable_type import SerializableType
-from fprime.common.models.serialize.array_type import ArrayType
-from fprime.common.models.serialize.numerical_types import (
-    U32Type,
-    U16Type,
-    U64Type,
-    U8Type,
-    I16Type,
-    I32Type,
-    I64Type,
-    I8Type,
-    F32Type,
-    F64Type,
-    IntegerType,
-)
-from fprime.common.models.serialize.string_type import StringType
-from fprime.common.models.serialize.bool_type import BoolType
-from fprime_gds.common.fpy.syntax import (
-    AstExpr,
-    AstFor,
-    AstOp,
-    AstReference,
-    Ast,
-    AstAssign,
-    AstScopedBody,
-    AstVar,
-)
+
 from fprime.common.models.serialize.type_base import BaseType as FppValue
+
+from fprime_gds.common.fpy.util import is_instance_compat
 
 MAX_DIRECTIVES_COUNT = 1024
 MAX_DIRECTIVE_SIZE = 2048
@@ -87,6 +29,135 @@ COMPILER_MAX_STRING_SIZE = 128
 FppType = type[FppValue]
 
 
+@dataclass
+class Ir:
+    id: int = field(init=False, repr=False, default=None)
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, value):
+        if not isinstance(value, Ir):
+            return False
+        assert self.id is not None
+        return self.id == value.id
+
+
+@dataclass
+class IrStmt(Ir):
+    pass
+
+
+@dataclass
+class IrInstruction(IrStmt):
+    # instruction generates strictly one directive
+    pass
+
+
+@dataclass
+class IrDirective(IrInstruction):
+    dir: Directive
+
+
+@dataclass
+class IrGoto(IrInstruction):
+    label: typing.Union[str, "IrBasicBlock"]
+
+
+@dataclass
+class IrIf(IrInstruction):
+    goto_false_label: str
+
+
+@dataclass
+class IrBasicBlock:
+    name: str
+    predecessors: list["IrBasicBlock"] = field(default_factory=list)
+    successors: list["IrBasicBlock"] = field(default_factory=list)
+    stmts: list[Union[IrStmt, Directive]] = field(default_factory=list)
+
+
+@dataclass
+class IrFunction:
+    args: dict[str, FppType]
+    return_type: FppType
+    blocks: list[IrBasicBlock] = field(default_factory=list)
+    # entry is first block
+
+
+@dataclass
+class IrModule:
+    funcs: list[IrFunction]
+
+
+class IrVisitor:
+
+    def _find_custom_visit_func(self, stmt: IrStmt):
+        for name, func in inspect.getmembers(type(self), inspect.isfunction):
+            if not name.startswith("visit"):
+                # not a visitor
+                continue
+            signature = inspect.signature(func)
+            params = list(signature.parameters.values())
+            assert len(params) == 6
+            assert params[1].annotation is not None
+            annotations = typing.get_type_hints(func)
+            param_type = annotations[params[1].name]
+            if is_instance_compat(stmt, param_type):
+                return getattr(self, name)
+        return self.visit_stmt_default
+
+    def _visit_stmt(
+        self,
+        stmt: IrStmt,
+        block: IrBasicBlock,
+        func: IrFunction,
+        mod: IrModule,
+        state: BackendState,
+    ):
+        visit_func = self._find_custom_visit_func(stmt)
+        visit_func(stmt, block, func, mod, state)
+
+    def visit_stmt_default(
+        self,
+        stmt: IrStmt,
+        block: IrBasicBlock,
+        func: IrFunction,
+        mod: IrModule,
+        state: BackendState,
+    ):
+        pass
+
+    def visit_basic_block(
+        self, block: IrBasicBlock, func: IrFunction, mod: IrModule, state: BackendState
+    ):
+        pass
+
+    def visit_function(self, func: IrFunction, mod: IrModule, state: BackendState):
+        pass
+
+    def visit_module(self, mod: IrModule, state: BackendState):
+        pass
+
+    def run(self, mod: IrModule, state: BackendState):
+        """runs the visitor, starting at the module, descending depth-first"""
+
+        for func in mod.funcs:
+            for block in func.blocks:
+                for stmt in block.stmts:
+                    self._visit_stmt(stmt, block, func, mod, state)
+                    if len(state.errors) != 0:
+                        return
+                self.visit_basic_block(block, func, mod, state)
+                if len(state.errors) != 0:
+                    return
+            self.visit_function(func, mod, state)
+            if len(state.errors) != 0:
+                return
+
+        self.visit_module(mod, state)
+        if len(state.errors) != 0:
+            return
 
 
 @dataclass
@@ -101,8 +172,6 @@ class BackendState:
     goto_indices: dict[Union[IrIf, IrGoto], int] = field(default_factory=dict)
 
     func_goto_labels: dict[IrFunction, dict[str, int]] = field(default_factory=dict)
-
-
 
     errors: list[BackendError] = field(default_factory=list)
     """a list of all compile exceptions generated by passes"""
@@ -172,7 +241,7 @@ def serialize_directives(dirs: list[Directive]) -> tuple[bytes, int]:
         dir_bytes = dir.serialize()
         if len(dir_bytes) > MAX_DIRECTIVE_SIZE:
             print(
-                FrontendError(
+                BackendError(
                     f"Directive {dir} in sequence too large (expected less than {MAX_DIRECTIVE_SIZE}, was {len(dir_bytes)})"
                 )
             )

@@ -9,7 +9,7 @@ import typing
 from typing import Union, get_origin, get_args
 import zlib
 
-from fprime_gds.common.fpy.ir import IrBasicBlock, IrFunction, IrModule
+from fprime_gds.common.fpy.backend_types import IrBasicBlock, IrFunction, IrGoto, IrIf, IrModule
 from lark import Transformer
 
 from fprime_gds.common.fpy.model import DirectiveErrorCode
@@ -25,7 +25,6 @@ from fprime_gds.common.fpy.frontend_types import (
     ArrayIndexType,
     FrontendState,
     FieldReference,
-    FppTypeClass,
     FpyCallable,
     FpyCmd,
     FpyMacro,
@@ -155,7 +154,9 @@ from fprime_gds.common.fpy.syntax import (
     AstVar,
     AstWhile,
 )
-from fprime.common.models.serialize.type_base import BaseType as FppType
+from fprime.common.models.serialize.type_base import BaseType as FppValue
+
+FppType = type[FppValue]
 
 
 class AssignIds(TopDownVisitor):
@@ -513,18 +514,21 @@ class ResolveVarsAndTypes(TopDownVisitor):
 class PickTypesAndResolveAttrsAndItems(Visitor):
 
     def coerce_expr_type(
-        self, node: AstExpr, type: FppTypeClass, state: FrontendState
+        self, node: AstExpr, type: FppType, state: FrontendState
     ) -> bool:
         unconverted_type = state.expr_unconverted_types[node]
         # make sure it isn't already being coerced
-        assert unconverted_type == state.expr_converted_types[node], (unconverted_type, state.expr_converted_types[node])
+        assert unconverted_type == state.expr_converted_types[node], (
+            unconverted_type,
+            state.expr_converted_types[node],
+        )
         if self.can_coerce_type(unconverted_type, type):
             state.expr_converted_types[node] = type
             return True
         state.err(f"Expected {type.__name__}, found {unconverted_type.__name__}", node)
         return False
 
-    def can_coerce_type(self, type: FppTypeClass, to_type: FppTypeClass) -> bool:
+    def can_coerce_type(self, type: FppType, to_type: FppType) -> bool:
         if type == to_type:
             return True
         if issubclass(type, IntegerType) and issubclass(to_type, NumericalType):
@@ -540,8 +544,8 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         return False
 
     def pick_intermediate_type(
-        self, arg_types: list[FppTypeClass], op: BinaryStackOp | UnaryStackOp
-    ) -> FppTypeClass:
+        self, arg_types: list[FppType], op: BinaryStackOp | UnaryStackOp
+    ) -> FppType:
 
         if op in BOOLEAN_OPERATORS:
             return BoolType
@@ -577,7 +581,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
 
         return I64Type
 
-    def is_type_constant_size(self, type: FppTypeClass) -> bool:
+    def is_type_constant_size(self, type: FppType) -> bool:
         """return true if the type is statically sized"""
         if issubclass(type, StringType):
             return False
@@ -594,8 +598,8 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         return True
 
     def get_members(
-        self, node: Ast, parent_type: FppTypeClass, state: FrontendState
-    ) -> list[tuple[str, FppTypeClass]] | None:
+        self, node: Ast, parent_type: FppType, state: FrontendState
+    ) -> list[tuple[str, FppType]] | None:
         if not issubclass(parent_type, (StructType, TimeType)):
             return {}
 
@@ -606,7 +610,7 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
             )
             return None
 
-        member_list: list[tuple[str, FppTypeClass]] = None
+        member_list: list[tuple[str, FppType]] = None
         if issubclass(parent_type, StructType):
             member_list = [t[0:2] for t in parent_type.MEMBER_LIST]
         else:
@@ -893,15 +897,17 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
                 return
 
     def visit_AstFor(self, node: AstFor, state: FrontendState):
-        # okay we have three types, but lb gets converted to lv, so we just have lv and ub
-        # so we're going to be comparing lv to ub type, so find an intermediate
-    
-        loop_var_ref = state.resolved_references[node.loop_var]
-        loop_var_type = loop_var_ref.type
+        # okay we have three types, but lb gets converted to lv, and so does ub
+        # so we're going to be comparing lv to lv type, so find an intermediate
+
+        loop_analysis = state.for_loops[node]
+        loop_var_type = loop_analysis.loop_var.type
 
         # handle the loop condition check
         # find intermediate type. we compare two variables of loop_var_type
-        intermediate_type = self.pick_intermediate_type([loop_var_type, loop_var_type], BinaryStackOp.LESS_THAN)
+        intermediate_type = self.pick_intermediate_type(
+            [loop_var_type, loop_var_type], BinaryStackOp.LESS_THAN
+        )
 
         if intermediate_type is None or intermediate_type is F64Type:
             state.err(
@@ -910,13 +916,13 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
             )
             return
 
-        state.for_loop_intermediate_type[node] = intermediate_type
+        loop_analysis.intermediate_type = intermediate_type
 
         # okay, and based on this intermediate type, pick a directive we're going to use to compare
         comparison_dir = BINARY_STACK_OPS[BinaryStackOp.LESS_THAN][intermediate_type]
 
         # store it for later
-        state.for_loop_comparison_directives[node] = comparison_dir
+        loop_analysis.comparision_dir = comparison_dir
 
         # upper and lower bounds must be coercible to loop variable type
         if not self.coerce_expr_type(node.lower_bound, loop_var_type, state):
@@ -929,7 +935,19 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
         # loop_var = loop_var + 1
         # LOAD, EXTEND, PUSH U64(1), IADD, TRUNC, STORE
 
-        self._visit(AstAssign(node.meta, node.loop_var, AstBinaryOp(node.meta, node.loop_var, "+", AstNumber(node.meta, 1))), state)
+        # okay handle the intermediate type for inc
+        intermediate_type_increment = self.pick_intermediate_type(
+            [loop_var_type, InternalIntType], BinaryStackOp.ADD
+        )
+        # they should be the same
+        assert intermediate_type == intermediate_type_increment, (
+            intermediate_type_increment,
+            intermediate_type,
+        )
+
+        loop_analysis.increment_dir = BINARY_STACK_OPS[BinaryStackOp.ADD][
+            intermediate_type
+        ]
 
     def visit_AstWhile(self, node: AstWhile, state: FrontendState):
         if not self.coerce_expr_type(node.condition, BoolType, state):
@@ -942,13 +960,6 @@ class PickTypesAndResolveAttrsAndItems(Visitor):
     def visit_default(self, node, state):
         # coding error, missed an expr
         assert not is_instance_compat(node, AstStmtWithExpr), node
-
-class LowerForLoopSyntax(Transformer):
-    """rewrites the tree to expand for loops into their given components"""
-    def visit_AstFor(self, node: AstFor, state: CompileState):
-
-
-
 
 
 class AllocateVariables(Visitor):
@@ -970,22 +981,22 @@ class AllocateVariables(Visitor):
             lhs_ref.lvar_offset = lvar_offset
 
     def visit_AstFor(self, node: AstFor, state: FrontendState):
+        loop_analysis = state.for_loops[node]
         # allocate space for the loop var
-        loop_var_ref = state.resolved_references[node.loop_var]
-        assert isinstance(loop_var_ref, FpyVariable)
+        loop_var = loop_analysis.loop_var
+        assert isinstance(loop_var, FpyVariable)
         lvar_offset = state.lvar_array_size_bytes
-        state.lvar_array_size_bytes += loop_var_ref.type.getMaxSize()
-        loop_var_ref.lvar_offset = lvar_offset
+        state.lvar_array_size_bytes += loop_var.type.getMaxSize()
+        loop_var.lvar_offset = lvar_offset
 
         # allocate space for the upper bound var
         # type of ub var is intermediate type
-        upper_bound_type = state.for_loop_intermediate_type[node]
         lvar_offset = state.lvar_array_size_bytes
-        upper_bound_var = FpyVariable(None, node, upper_bound_type, lvar_offset)
+        upper_bound_var = FpyVariable(None, node, loop_var.type, lvar_offset)
         state.lvar_array_size_bytes += upper_bound_var.type.getMaxSize()
         upper_bound_var.lvar_offset = lvar_offset
         # store ub var in a dict for later
-        state.for_loop_upper_bound_variables[node] = upper_bound_var
+        loop_analysis.upper_bound_var = upper_bound_var
 
 
 class CalculateConstExprValues(Visitor):
@@ -993,7 +1004,7 @@ class CalculateConstExprValues(Visitor):
     calculated at compile time, and NothingType if the expr had no value"""
 
     def const_coerce_type(
-        self, from_val: FppType, to_type: FppTypeClass, node: Ast, state: FrontendState
+        self, from_val: FppType, to_type: FppType, node: Ast, state: FrontendState
     ) -> FppType | None:
         try:
             if type(from_val) == to_type:
@@ -1212,6 +1223,7 @@ class CalculateConstExprValues(Visitor):
         # coding error, missed an expr
         assert not is_instance_compat(node, AstExpr), node
 
+
 class GenerateConstExprDirectives(Visitor):
     """for each expr with a constant compile time value, generate
     directives for how to put it in its register"""
@@ -1251,6 +1263,19 @@ class GenerateConstExprDirectives(Visitor):
         state.directives[node] = [PushValDirective(serialized_expr_value)]
 
 
+class GenerateFunctions(Visitor):
+    def visit_AstScopedBody(self, node: AstScopedBody, state: FrontendState):
+        if node != state.root:
+            return
+        
+        # this is the root node. at the moment, it is an implicit function which takes no arguments
+        main_func = IrFunction({}, NothingType)
+        entry_block = IrBasicBlock(f"{node.id}.entry")
+        main_func.blocks.append(entry_block)
+        state.main_func = main_func
+
+
+# handles everything with linear control flow, or whose only exit is ending the program
 class GenerateExprMacrosAndCmds(Visitor):
     """for each expr whose value is not known at compile time, but can be calculated at run time,
     generate directives to calculate the value and put it in its register. for each command
@@ -1635,14 +1660,138 @@ class GenerateExprMacrosAndCmds(Visitor):
 
         state.directives[node] = directives
 
+
+class GenerateBasicBlocks(Visitor):
+
     def visit_AstFor(self, node: AstFor, state: FrontendState):
-        # convert the lower bound into the intermediate type
-        pass
+        # first set up the control flow graph
+        func = state.main_func
+        # start from the most recent block of the enclosing function
+        starting_block = func.blocks[-1]
+        # each loop creates 3 new blocks
+        # the condition block for the loop end condition check
+        cond_block = IrBasicBlock(f"{node.id}.check_end")
+        # the body (and the increment)
+        body_block = IrBasicBlock(f"{node.id}.body")
+        # and everything after the loop
+        exit_block = IrBasicBlock(f"{node.id}.exit")
+        func.blocks.append(cond_block)
+        func.blocks.append(body_block)
+        func.blocks.append(exit_block)
 
-# TODO rewrite the AST here
+        loop_analysis = state.for_loops[node]
 
-class GenerateIrBlocks(Visitor):
+        # we need to do a few things:
+        # 1. initialize the loop var, and store the lower bound in it
+        # 2. calculate the upper bound and store it in the upper bound var
+
+        # then, on each loop:
+        # 3. check loop condition
+        # 4. execute body
+        # 5. increment loop var
+        # 6. go back to start
+
+        # 1. set loop var to lower bound
+        # start with previous stmts
+        dirs = starting_block.stmts
+        # push lower bound to stack
+        # the converted type of these dirs should be the loop_var type
+        dirs.extend(state.directives[node.lower_bound])
+        # now store in lvar
+        loop_var = loop_analysis.loop_var
+        assert state.expr_converted_types[node.lower_bound] == loop_var.type
+        # store in loop var
+        dirs.append(
+            StoreConstOffsetDirective(loop_var.lvar_offset, loop_var.type.getMaxSize())
+        )
+
+        # 2. calc upper bound and store it in upper bound var
+
+        # push upper bound to stack
+        # the converted type of the ub expr should be intermediate_type
+        dirs.extend(state.directives[node.upper_bound])
+        intermediate_type = loop_analysis.intermediate_type
+        upper_bound_var = loop_analysis.upper_bound_var
+        # store in upper bound var
+        dirs.append(
+            StoreConstOffsetDirective(
+                upper_bound_var.lvar_offset, upper_bound_var.type.getMaxSize()
+            )
+        )
+
+        # okay, loop and UB vars have the right initial value
+        # end of this basic block
+        # go to next basic block unconditionally
+        dirs.append(IrGoto(body_block))
+
+        dirs = cond_block.stmts
+
+        # 3. now add the "end-of-loop" check
+        # loop var should be "loop var" type
+        lhs_cmp_dirs = state.directives[node.loop_var]
+        # ub should be also "loop var" type
+        rhs_cmp_dirs = [
+            LoadDirective(
+                upper_bound_var.lvar_offset, upper_bound_var.type.getMaxSize()
+            )
+        ]
+
+        # convert lv to intermediate type
+        lhs_cmp_dirs.extend(convert_numeric_type(loop_var.type, intermediate_type))
+        rhs_cmp_dirs.extend(convert_numeric_type(loop_var.type, intermediate_type))
+
+        # which variant of the op did we pick?
+        cmp_dir = loop_analysis.comparision_dir
+
+        # push lhs and rhs to stack
+        dirs.extend(lhs_cmp_dirs)
+        dirs.extend(rhs_cmp_dirs)
+        # generate the actual cmp op itself
+        dirs.append(cmp_dir())
+
+        # if failure of condition, go to exit block
+        dirs.append(IrIf(exit_block))
+        # end of this basic block!
+
+        dirs = body_block.stmts
+
+        # 4. include body
+        dirs.extend(state.directives[node.body])
+
+        # 5. increment loop var
+        # push loop var to stack
+        dirs.append(LoadDirective(loop_var.lvar_offset, loop_var.type.getMaxSize()))
+        # convert loop var to intermediate type
+        dirs.extend(convert_numeric_type(loop_var.type, intermediate_type))
+        # push 1 to stack
+        dirs.append(PushValDirective(U64Type(1).serialize()))
+        # add them
+        dirs.append(IntAddDirective())
+        # convert back into loop var type
+        dirs.extend(convert_numeric_type(intermediate_type, loop_var.type))
+        # store in lvar array
+        dirs.append(
+            StoreConstOffsetDirective(loop_var.lvar_offset, loop_var.type.getMaxSize())
+        )
+        # okay, done with this iteration of the loop. go back up to the end-of-loop check
+        dirs.append(IrGoto(cond_block))
+
+
     def visit_AstIf(self, node: AstIf, state: FrontendState):
+        # first set up the control flow graph
+        func = state.main_func
+        # start from the most recent block of the enclosing function
+        starting_block = func.blocks[-1]
+
+        # create a block for the then case
+        body_block = IrBasicBlock(f"{node.id}.then")
+        func.blocks.append(body_block)
+        # and create a block for the merge
+        exit_block = IrBasicBlock(f"{node.id}.merge")
+        func.blocks.append(cond_block)
+        func.blocks.append(body_block)
+        func.blocks.append(exit_block)
+        
 
         all_dirs = []
 
@@ -1687,97 +1836,6 @@ class GenerateIrBlocks(Visitor):
 
     def visit_AstFor(self, node: AstFor, state: FrontendState):
         start_line_idx = state.start_line_idx[node]
-        # we need to do a few things:
-        # 1. initialize the loop var, and store the lower bound in it
-        # 2. calculate the upper bound and store it in the upper bound var
-        
-        # then, on each loop:
-        # 3. check loop condition
-        # 4. execute body
-        # 5. increment loop var
-        # 6. go back to start
-
-        # 1. set loop var to lower bound
-        # push lower bound to stack
-        # the converted type of these dirs should be the loop_var type
-        dirs = state.directives[node.lower_bound].copy()
-        # now store in lvar
-        loop_var = state.resolved_references[node.loop_var]
-        assert state.expr_converted_types[node.lower_bound] == loop_var.type
-        # store in loop var
-        dirs.append(
-            StoreConstOffsetDirective(loop_var.lvar_offset, loop_var.type.getMaxSize())
-        )
-
-        # 2. calc upper bound and store it in upper bound var
-
-        # push upper bound to stack
-        # the converted type of the ub expr should be intermediate_type
-        dirs.extend(state.directives[node.upper_bound])
-        intermediate_type = state.for_loop_intermediate_type[node]
-        upper_bound_var = state.for_loop_upper_bound_variables[node]
-        # store in upper bound var
-        dirs.append(
-            StoreConstOffsetDirective(
-                upper_bound_var.lvar_offset, intermediate_type.getMaxSize()
-            )
-        )
-
-
-        # okay, loop and UB vars have the right initial value
-        # begin the loop!
-
-        # 3. now add the "end-of-loop" check
-
-        end_of_loop_check_start_idx = start_line_idx + len(dirs)
-
-        upper_bound_var = state.for_loop_upper_bound_variables[node]
-
-        # loop var should be "loop var" type
-        lhs_cmp_dirs = state.directives[node.loop_var]
-        # ub should be intermediate type
-        rhs_cmp_dirs = [LoadDirective(upper_bound_var.lvar_offset, upper_bound_var.type.getMaxSize())]
-
-        # convert lv to intermediate type
-        lhs_cmp_dirs.extend(convert_numeric_type(loop_var.type, intermediate_type))
-
-        # which variant of the op did we pick?
-        cmp_dir = state.for_loop_comparison_directives[node]
-
-        # push lhs and rhs to stack
-        dirs.extend(lhs_cmp_dirs)
-        dirs.extend(rhs_cmp_dirs)
-        # generate the actual cmp op itself
-        dirs.append(cmp_dir())
-
-        if_dir = IfDirective(-1)
-        dirs.append(if_dir)
-        # okay now include body
-        dirs.extend(state.directives[node.body])
-        # okay increment loop var
-        # push loop var to stack
-        dirs.append(LoadDirective(loop_var.lvar_offset, loop_var.type.getMaxSize()))
-        # convert loop var to intermediate type
-        dirs.extend(convert_numeric_type(loop_var.type, intermediate_type))
-        # push 1 to stack
-        dirs.append(PushValDirective(U64Type(1).serialize()))
-        # add them
-        dirs.append(IntAddDirective())
-        # convert back into loop var type
-        dirs.extend(convert_numeric_type(intermediate_type, loop_var.type))
-        # store in lvar array
-        dirs.append(
-            StoreConstOffsetDirective(loop_var.lvar_offset, loop_var.type.getMaxSize())
-        )
-        # okay, done with this iteration of the loop. go back up to the end-of-loop check
-        dirs.append(GotoDirective(end_of_loop_check_start_idx))
-
-        # and now update the if directive to go to just past the end of the body
-        if_dir.false_goto_dir_index = start_line_idx + len(dirs)
-
-        # okay! all done
-
-        state.directives[node] = dirs
 
     def visit_AstBody(self, node: Union[AstBody, AstScopedBody], state: FrontendState):
         dirs = []
@@ -1793,42 +1851,6 @@ class GenerateIrBlocks(Visitor):
                 dirs.extend(stmt_dirs)
 
         state.directives[node] = dirs
-
-
-class GenerateIrBasicBlocks(Visitor):
-
-    def __init__(self):
-        self.block: IrBasicBlock = None
-
-    def visit_default(self, node, state):
-        dirs = state.stmt_directives.get(node)
-        if dirs is None:
-            # don't generate any directives for this node
-            return
-        self.block.stmts.append()
-
-    def visit_AstIf(self, node: AstIf, state: FrontendState):
-        # use the unique node id in the name of the blocks
-        # the "then" block is the one that gets executed if the condition is true
-        # one possible predecessor: the current basic block
-        then_block = IrBasicBlock(f"{node.id}.then", [], [], [self.block])
-        # the merge block is the code that gets executed after the if condition
-        # several possible predecessors: the "then" block, the elif blocks, or the else block
-        # start by just including the "then" block
-        merge_block = IrBasicBlock(f"{node.id}.merge", [], [], [then_block])
-
-        else_block = None
-        if node.els is not None:
-            else_block = IrBasicBlock(f"{node.id}.else", [], [], [self.block])
-            merge_block.predecessors.append(else_block)
-
-        
-
-    def visit_AstElif(self, node: AstElif, state: FrontendState):
-        then_block = IrBasicBlock(f"{node.id}.then", [], [], [self.block])
-        merge_block = IrBasicBlock(f"{node.id}.merge", [], [], [then_block, self.block])
-
-
 
 
 def get_base_compile_state(dictionary: str) -> FrontendState:
@@ -1924,6 +1946,7 @@ def get_base_compile_state(dictionary: str) -> FrontendState:
 
 def ast_to_ir(body: AstScopedBody, dictionary: str) -> IrModule | FrontendError:
     state = get_base_compile_state(dictionary)
+    state.root = body
     passes: list[Visitor] = [
         AssignIds(),
         AssignLocalScopes(),
