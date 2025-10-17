@@ -537,6 +537,7 @@ class FrontendState:
 
     root: AstScopedBody = None
     main_func: IrFunction = None
+    basic_blocks: dict[Ast, list[IrBasicBlock]] = field(default_factory=dict)
     scope_parents: dict[AstScopedBody, AstScopedBody | None] = field(
         default_factory=dict, repr=False
     )

@@ -9,7 +9,7 @@ import typing
 from typing import Union, get_origin, get_args
 import zlib
 
-from fprime_gds.common.fpy.backend_types import IrBasicBlock, IrFunction, IrGoto, IrIf, IrModule
+from fprime_gds.common.fpy.backend_types import IrBasicBlock, IrFallthrough, IrFunction, IrGoto, IrIf, IrInstruction, IrModule
 from lark import Transformer
 
 from fprime_gds.common.fpy.model import DirectiveErrorCode
@@ -1663,21 +1663,56 @@ class GenerateExprMacrosAndCmds(Visitor):
 
 class GenerateBasicBlocks(Visitor):
 
+    def __init__(self):
+        self.blocks: list[IrBasicBlock] = []
+
+    def begin(self, node: Ast):
+        assert len(self.blocks) == 0
+        self.blocks.append(IrBasicBlock(node, "begin"))
+
+    def inline_node(self, node: Ast, state: FrontendState):
+        blocks = state.basic_blocks.get(node)
+        if blocks is not None:
+            self.blocks.extend(blocks)
+            assert node not in state.directives
+        else:
+            self.emit(state.directives[node])
+            assert node not in state.basic_blocks
+
+    def emit(self, dir: Union[Directive, IrInstruction, list[Union[Directive, IrInstruction]]]):
+        assert len(self.blocks) > 0
+        if isinstance(dir, list):
+            self.blocks[-1].stmts.extend(dir)
+        else:
+            self.blocks[-1].stmts.append(dir)
+
+    def branch(self, branch: IrInstruction):
+
+    def end(self, node: Ast, state: FrontendState):
+        state.basic_blocks[node] = self.blocks
+        self.blocks = []
+
+    def visit_AstBody(self, node: AstBody, state: FrontendState):
+        self.begin(node)
+        # bodies are just blocks with no control flow of their own
+        # inline each of the nodes in this body
+        for stmt in node.stmts:
+            self.inline_node(stmt, state)
+
+        self.end(node, state)
+
+
     def visit_AstFor(self, node: AstFor, state: FrontendState):
+        self.begin(node)
         # first set up the control flow graph
-        func = state.main_func
-        # start from the most recent block of the enclosing function
-        starting_block = func.blocks[-1]
-        # each loop creates 3 new blocks
+
+        # each loop uses 3 blocks
         # the condition block for the loop end condition check
-        cond_block = IrBasicBlock(f"{node.id}.check_end")
-        # the body (and the increment)
-        body_block = IrBasicBlock(f"{node.id}.body")
+        cond_block = IrBasicBlock(node, "check_end")
+        # the body block(s) (where we put the increment)
+        body_blocks = state.basic_blocks[node.body]
         # and everything after the loop
-        exit_block = IrBasicBlock(f"{node.id}.exit")
-        func.blocks.append(cond_block)
-        func.blocks.append(body_block)
-        func.blocks.append(exit_block)
+        exit_block = IrBasicBlock(node, "exit")
 
         loop_analysis = state.for_loops[node]
 
@@ -1693,7 +1728,7 @@ class GenerateBasicBlocks(Visitor):
 
         # 1. set loop var to lower bound
         # start with previous stmts
-        dirs = starting_block.stmts
+        dirs = blocks[-1].stmts
         # push lower bound to stack
         # the converted type of these dirs should be the loop_var type
         dirs.extend(state.directives[node.lower_bound])
@@ -1722,9 +1757,10 @@ class GenerateBasicBlocks(Visitor):
         # okay, loop and UB vars have the right initial value
         # end of this basic block
         # go to next basic block unconditionally
-        dirs.append(IrGoto(body_block))
+        dirs.append(IrFallthrough())
 
-        dirs = cond_block.stmts
+        blocks.append(cond_block)
+        dirs = blocks[-1].stmts
 
         # 3. now add the "end-of-loop" check
         # loop var should be "loop var" type
@@ -1750,15 +1786,16 @@ class GenerateBasicBlocks(Visitor):
         dirs.append(cmp_dir())
 
         # if failure of condition, go to exit block
-        dirs.append(IrIf(exit_block))
-        # end of this basic block!
-
-        dirs = body_block.stmts
+        # otherwise go to first body block
+        dirs.append(IrIf(body_blocks[0], exit_block))
+        # end of cond block
 
         # 4. include body
-        dirs.extend(state.directives[node.body])
+        blocks.extend(body_blocks)
+
 
         # 5. increment loop var
+        dirs = blocks[-1].stmts
         # push loop var to stack
         dirs.append(LoadDirective(loop_var.lvar_offset, loop_var.type.getMaxSize()))
         # convert loop var to intermediate type
@@ -1776,22 +1813,64 @@ class GenerateBasicBlocks(Visitor):
         # okay, done with this iteration of the loop. go back up to the end-of-loop check
         dirs.append(IrGoto(cond_block))
 
+        state.basic_blocks[node] = blocks
+
+    def visit_AstElif(self, node: AstElif, state: FrontendState):
+        starting_block = IrBasicBlock(node, "begin")
+        blocks = [starting_block]
+        body_blocks = state.basic_blocks[node.body]
+        merge_block = IrBasicBlock(node, "merge")
+
+        dirs = starting_block.stmts
+        dirs.extend(state.directives[node.condition])
+        dirs.append(IrIf(body_blocks, merge_block))
+
+        blocks.extend(body_blocks)
+
+
+        
+
 
     def visit_AstIf(self, node: AstIf, state: FrontendState):
+        blocks = []
         # first set up the control flow graph
-        func = state.main_func
-        # start from the most recent block of the enclosing function
-        starting_block = func.blocks[-1]
-
+        # start from an empty block (this will be merged with the previous block in the backend)
+        starting_block = IrBasicBlock(f"{node.id}.begin")
+        blocks.append(starting_block)
         # create a block for the then case
-        body_block = IrBasicBlock(f"{node.id}.then")
-        func.blocks.append(body_block)
+        then_block = IrBasicBlock(f"{node.id}.then")
+        blocks.append(then_block)
+
+
         # and create a block for the merge
-        exit_block = IrBasicBlock(f"{node.id}.merge")
-        func.blocks.append(cond_block)
-        func.blocks.append(body_block)
-        func.blocks.append(exit_block)
-        
+        merge_block = IrBasicBlock(f"{node.id}.merge")
+        # keep track of the block we should go to if the condition is false
+        false_block = merge_block
+        # create a block for the else or elifs cases if we have one
+        if node.els is not None or node.elifs is not None:
+            else_block = IrBasicBlock(f"{node.id}.else")
+            false_block = else_block
+
+        dirs = starting_block.stmts
+        # put the conditional on top of stack
+        dirs.extend(state.directives[node.condition])
+        # if false, go to merge or else block, otherwise go to then block (fallthrough)
+        dirs.append(IrIf(then_block, false_block))
+
+
+        dirs = then_block.stmts
+        # okay now we're in the then block, add the body
+        dirs.extend(state.directives[node.body])
+
+        # okay now unconditionally go to merge
+        dirs.append(IrGoto(merge_block))
+
+        # if we have other cases, include them in the else block
+        if node.elifs is not None:
+            # inline the elif blocks here...
+            
+        if node.els is not None:
+            # in the else block
 
         all_dirs = []
 
@@ -1806,11 +1885,6 @@ class GenerateBasicBlocks(Visitor):
 
         for case in cases:
             case_dirs = []
-            # put the conditional on top of stack
-            case_dirs.extend(state.directives[case[0]])
-            # include if stmt (update the end idx later)
-            if_dir = IfDirective(-1)
-
             case_dirs.append(if_dir)
             # include body
             case_dirs.extend(state.directives[case[1]])
@@ -1831,6 +1905,8 @@ class GenerateBasicBlocks(Visitor):
 
         for goto in goto_ends:
             goto.dir_idx = start_line_idx + len(all_dirs)
+
+        func.blocks.append(merge_block)
 
         state.directives[node] = all_dirs
 

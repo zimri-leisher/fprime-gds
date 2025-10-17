@@ -15,6 +15,7 @@ from fprime_gds.common.fpy.bytecode.directives import (
 
 from fprime.common.models.serialize.type_base import BaseType as FppValue
 
+from fprime_gds.common.fpy.syntax import Ast
 from fprime_gds.common.fpy.util import is_instance_compat
 
 MAX_DIRECTIVES_COUNT = 1024
@@ -65,12 +66,20 @@ class IrGoto(IrInstruction):
 
 
 @dataclass
+class IrFallthrough(IrInstruction):
+    pass
+
+
+# TODO consider making this have two args, one which is the true case, one which is false
+@dataclass
 class IrIf(IrInstruction):
-    goto_false_label: str
+    true_case: IrBasicBlock
+    false_case: IrBasicBlock
 
 
 @dataclass
 class IrBasicBlock:
+    node: Ast
     name: str
     predecessors: list["IrBasicBlock"] = field(default_factory=list)
     successors: list["IrBasicBlock"] = field(default_factory=list)
