@@ -1728,15 +1728,14 @@ class GenerateBasicBlocks(Visitor):
 
         # 1. set loop var to lower bound
         # start with previous stmts
-        dirs = blocks[-1].stmts
         # push lower bound to stack
         # the converted type of these dirs should be the loop_var type
-        dirs.extend(state.directives[node.lower_bound])
+        self.emit(state.directives[node.lower_bound])
         # now store in lvar
         loop_var = loop_analysis.loop_var
         assert state.expr_converted_types[node.lower_bound] == loop_var.type
         # store in loop var
-        dirs.append(
+        self.emit(
             StoreConstOffsetDirective(loop_var.lvar_offset, loop_var.type.getMaxSize())
         )
 
@@ -1744,11 +1743,11 @@ class GenerateBasicBlocks(Visitor):
 
         # push upper bound to stack
         # the converted type of the ub expr should be intermediate_type
-        dirs.extend(state.directives[node.upper_bound])
+        self.emit(state.directives[node.upper_bound])
         intermediate_type = loop_analysis.intermediate_type
         upper_bound_var = loop_analysis.upper_bound_var
         # store in upper bound var
-        dirs.append(
+        self.emit(
             StoreConstOffsetDirective(
                 upper_bound_var.lvar_offset, upper_bound_var.type.getMaxSize()
             )
