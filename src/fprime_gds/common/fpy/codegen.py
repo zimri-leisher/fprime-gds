@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import inspect
 from typing import Callable, Union, get_args, get_origin
 import typing
+import llvmlite.ir as ll
 
 # In Python 3.10+, the `|` operator creates a `types.UnionType`.
 # We need to handle this for forward compatibility, but it won't exist in 3.9.
@@ -128,6 +129,9 @@ class GenerateCode:
         self.emitters: dict[type[Ast], Callable] = {}
         """dict of node type to handler function"""
         self.build_emitter_dict()
+        self.module: ll.Module = None
+        self.func: ll.Function = None
+        self.builder: ll.IRBuilder = None
 
     def try_emit_expr_as_const(
         self, node: AstExpr, state: CompileState
@@ -304,14 +308,13 @@ class GenerateCode:
     def emit_AstScopedBody(self, node: AstScopedBody, state: CompileState):
         dirs = []
         if state.root == node:
-            # calculate lvar array size bytes, also assign lvar offsets
-            for var in state.variables:
-                # doesn't have an lvar idx, allocate one
-                lvar_offset = state.lvar_array_size_bytes
-                state.lvar_array_size_bytes += var.type.getMaxSize()
-                var.lvar_offset = lvar_offset
+            self.module = ll.Module("main_module")
+            empty_func_type = ll.FunctionType(ll.VoidType(), [])
+            self.func = ll.Function(self.module, empty_func_type, "main")
+            entry_block = self.func.append_basic_block()
+            self.builder = ll.IRBuilder()
+            self.builder.position_at_end(entry_block)
 
-            dirs.append(AllocateDirective(state.lvar_array_size_bytes))
         for stmt in node.stmts:
             if not is_instance_compat(stmt, AstNodeWithSideEffects):
                 # if the stmt can't do anything on its own, ignore it
