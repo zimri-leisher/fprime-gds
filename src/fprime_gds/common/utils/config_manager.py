@@ -14,21 +14,13 @@ Based on the ConfigManager class written by Len Reder in the fprime Gse
 @license Copyright 2018, California Institute of Technology.
          ALL RIGHTS RESERVED. U.S. Government Sponsorship acknowledged.
 """
-import configparser
 
-# Custom type modules
 from fprime.common.models.serialize.numerical_types import (
-    F32Type,
-    F64Type,
-    I8Type,
-    I16Type,
-    I32Type,
-    I64Type,
-    U8Type,
     U16Type,
     U32Type,
-    U64Type,
 )
+from fprime.common.models.serialize.type_base import BaseType
+from typing import Any
 
 
 class ConfigBadTypeException(Exception):
@@ -40,16 +32,25 @@ class ConfigBadTypeException(Exception):
             config_name (string): Name of the config containing the bad type
             type_str (string): Bad type string that caused the error
         """
-        super().__init__(f"Invalid type string {type_str} read in configuration {config_name}")
+        super().__init__(
+            f"Invalid type string {type_str} read in configuration {config_name}"
+        )
 
 
-class ConfigManager(configparser.ConfigParser):
+class ConfigManager:
     """
-    This class provides a single entrypoint for all configurable properties,
+    This class provides a single entrypoint for all configurable properties of the GDS
+
+    The properties are meant to be stored in 3 sections (sub-dictionaries):
+    1. types - typeDefinitions from FSW dictionary (key: qualifiedName, value: Type class)
+    2. constants - constants definitions from FSW dictionary (key: qualifiedName, value: int)
+    3. config - mapping of config field names to arbitrary values (managed internally)
     """
 
+    # Singleton instance
     __instance = None
-    __prop = None
+    # Dictionary holding all config properties
+    __prop: dict
 
     def __init__(self):
         """
@@ -61,25 +62,10 @@ class ConfigManager(configparser.ConfigParser):
             An instance of the ConfigManager class. Default configurations
             will be used until the set_configs method is called!
         """
-        # Cannot use super() function since ConfigParser is an old-style class
-        configparser.ConfigParser.__init__(self)
-
-        # Set default properties
-        self.__prop = {}
+        # `types` and `constants` are meant to be pulled from the FSW dictionary
+        # `config` is for config that is internal to the GDS
+        self.__prop = {"types": {}, "constants": {}, "config": {}}
         self._set_defaults()
-        self.file_path = None
-
-    def set_configs(self, f):
-        """
-        Sets the configuration values to those in the given file
-
-        Will raise an exception if the file does not exist.
-
-        Args:
-            f (string): Path to a file object to read
-        """
-        self.file_path = f
-        self.read_file(open(f))
 
     @staticmethod
     def get_instance():
@@ -93,11 +79,9 @@ class ConfigManager(configparser.ConfigParser):
             ConfigManager.__instance = ConfigManager()
         return ConfigManager.__instance
 
-    def get_type(self, name):
+    def get_type(self, name: str) -> BaseType:
         """
-        Retrieve a type from the config file for parsing
-
-        It is assumed the setting is in the types section
+        Return an **instance** of the associated type.
 
         Args:
             name (string): Name of the type to retrieve
@@ -106,86 +90,104 @@ class ConfigManager(configparser.ConfigParser):
             If the name is valid, returns an object of a type derived from
             TypeBase. Otherwise, raises ConfigBadTypeException
         """
-        type_str = self.get("types", name)
+        type_class = self.__prop["types"].get(name, None)
+        if type_class is None:
+            raise ConfigBadTypeException(name, "Unknown type name")
+        # Return an instance of the type
+        return type_class()
 
-        if type_str == "U8":
-            return U8Type()
-        if type_str == "U16":
-            return U16Type()
-        if type_str == "U32":
-            return U32Type()
-        if type_str == "U64":
-            return U64Type()
-        if type_str == "I8":
-            return I8Type()
-        if type_str == "I16":
-            return I16Type()
-        if type_str == "I32":
-            return I32Type()
-        if type_str == "I64":
-            return I64Type()
-        if type_str == "F32":
-            return F32Type()
-        if type_str == "F64":
-            return F64Type()
-        # These are types for parsing, so they need to be number types
-        # Other types can be added later
-        raise ConfigBadTypeException(name, type_str)
-
-    def get_file_path(self):
+    def set_type(self, name: str, type_class: type[BaseType]):
         """
-        Return file loaded for this configuration
+        Set a type in the config for parsing by associating a name with
+        a type class.
 
-        :return: file path
+        Args:
+            name (string): Name of the type to set
+            type_class (type[TypeBase]): Class of (**not** instance of) the type to associate with the name
+
+        Returns:
+            None
         """
-        return self.file_path
+        self.__prop["types"][name] = type_class
+
+    def get_constant(self, name: str) -> int:
+        """
+        Get constant from the config, returning the associated integer value
+
+        Args:
+            name (string): Name of the constant to retrieve
+
+        Returns:
+            If the name is known, returns the value of the constant.
+            Otherwise, raises ConfigBadTypeException
+        """
+        constant_value = self.__prop["constants"].get(name, None)
+        if constant_value is None:
+            raise ConfigBadTypeException(name, "Unknown constant name")
+        return constant_value
+
+    def set_constant(self, name: str, value: int):
+        """
+        Set a constant in the config for parsing by associating a name with
+        an integer value.
+
+        Args:
+            name (string): Name of the constant to set
+            value (int): Value of the constant to associate with the name
+
+        Returns:
+            None
+        """
+        self.__prop["constants"][name] = value
+
+    def get_config(self, name: str) -> Any:
+        """
+        Get config field from the config, returning the associated object
+
+        Args:
+            name (string): Name of the config field to retrieve
+
+        Returns:
+            If the name is known, returns the config field.
+            Otherwise, raises ConfigBadTypeException
+        """
+        config_value = self.__prop["config"].get(name, None)
+        if config_value is None:
+            raise ConfigBadTypeException(name, "Unknown config field name")
+        return config_value
+
+    def set_config(self, name: str, entry: Any):
+        """
+        Set a configuration entry in the config
+
+        Args:
+            name (string): Name of the config to set
+            entry (Any): config to associate with the name
+
+        Returns:
+            None
+        """
+        self.__prop["config"][name] = entry
 
     def _set_defaults(self):
         """
-        Used by the constructor to set all ConfigParser defaults
-
-        Establishes a dictionary of sections and then a dictionary of keyword,
-        value association for each section.
+        Used by the constructor to set all ConfigManager defaults
         """
-
-        ########################## TYPES ###########################
-        # These configs give the types of fields in the binary data
-
-        self.__prop["types"] = {
-            "msg_len": "U32",
-            "FwPacketDescriptorType": "U32",
-            "FwChanIdType": "U32",
-            "FwEventIdType": "U32",
-            "FwOpcodeType": "U32",
-            "FwTlmPacketizeIdType": "U16",
-            "key_val": "U16",
-        }
-        self._set_section_defaults("types")
-
-        ######################### COLORS ###########################
-        # Colors are hex codes in BGR format
-
-        self.__prop["colors"] = {
-            "warning_lo": "0x00BCED",
-            "warning_hi": "0x0073E5",
-            "fatal": "0x0000FF",
-            "command": "0xFF0000",
-            "red": "0x0000FF",
-            "orange": "0x0073E5",
-            "yellow": "0x00BCED",
-        }
-        self._set_section_defaults("colors")
-
-        self.__prop["framing"] = {"use_key": "False", "key_val": "0x0"}
-        self._set_section_defaults("framing")
-
-    def _set_section_defaults(self, section):
-        """
-        For a section set up the default values.
-
-        Args:
-            section: Section to set all the defaults config values for
-        """
-        self.add_section(section)
-        for (key, value) in self.__prop[section].items():
-            self.set(section, key, str(value))
+        self.__prop["types"].update(
+            {
+                "FwPacketDescriptorType": U16Type,
+                "FwChanIdType": U32Type,
+                "FwEventIdType": U32Type,
+                "FwOpcodeType": U32Type,
+                "FwTlmPacketizeIdType": U16Type,
+            }
+        )
+        self.__prop["config"].update(
+            {
+                # msg_len is an internal type used within the GDS only
+                "msg_len": U32Type,
+                # Used for processing logged data from Svc.ComLogger
+                "key_val": U16Type,
+                "use_key": False
+            }
+        )

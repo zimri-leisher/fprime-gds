@@ -13,7 +13,6 @@ import datetime
 import errno
 import functools
 import getpass
-import inspect
 import itertools
 import os
 import platform
@@ -374,6 +373,8 @@ class ConfigDrivenParser(ParserBase):
     def flatten_options(configured_options):
         """Flatten options down to arguments"""
         flattened = []
+        if configured_options is None:
+            return flattened
         for option, value in configured_options.items():
             flattened.append(f"--{option}")
             if value is not None:
@@ -982,12 +983,21 @@ class MiddleWareParser(ParserBase):
 
 
 class DictionaryParser(DetectionParser):
-    """Parser for deployments"""
+    """Parser for locating and loading dictionary information
+
+    IMPORTANT: Since this parser loads global configuration that other parsers may depend on
+    (only framing plugin at this time), it is recommended to list it first in any CompositeParser
+    Not doing so would mean other parsers don't have access to dictionary config at handle_arguments time.
+
+    This parser loads all dictionary elements and make them available for later use.
+    It also updates the global ConfigManager with all type and constant definitions found
+    in the dictionary.
+    """
 
     DESCRIPTION = "Dictionary options"
 
     def get_arguments(self) -> Dict[Tuple[str, ...], Dict[str, Any]]:
-        """Arguments to handle deployments"""
+        """Arguments to handle dictionary."""
         return {
             **super().get_arguments(),
             **{
@@ -1035,10 +1045,13 @@ class DictionaryParser(DetectionParser):
             args.dictionary, args.packet_spec, args.packet_set_name
         )
         config = ConfigManager.get_instance()
-        # Update config to use Fw types defined in the JSON dictionary
-        if dictionaries.fw_type_name:
-            for fw_type_name, fw_type in dictionaries.fw_type_name.items():
-                config.set("types", fw_type_name, fw_type)
+        # Update config to use type definitions defined in the JSON dictionary
+        if dictionaries.typedefs_name:
+            for type_name, type_dict in dictionaries.typedefs_name.items():
+                config.set_type(type_name, type_dict)
+        if dictionaries.constant_name:
+            for name, value in dictionaries.constant_name.items():
+                config.set_constant(name, value)
         args.dictionaries = dictionaries
         return args
 
@@ -1127,10 +1140,10 @@ class CommParser(CompositeParser):
     """Comm Executable Parser"""
 
     CONSTITUENTS = [
+        DictionaryParser,  # needed to get types from dictionary for framing
         CommExtraParser,
         MiddleWareParser,
         LogDeployParser,
-        DictionaryParser,  # needed to get types from dictionary for framing
     ]
 
     def __init__(self):

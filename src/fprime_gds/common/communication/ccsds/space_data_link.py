@@ -1,8 +1,10 @@
 """F Prime Framer/Deframer Implementation of the CCSDS Space Data Link (TC/TM) Protocols"""
+
 import sys
 import struct
 import copy
 
+from fprime_gds.common.utils.config_manager import ConfigBadTypeException, ConfigManager
 from fprime_gds.common.communication.framing import FramerDeframer
 from fprime_gds.plugin.definitions import gds_plugin_implementation
 
@@ -14,6 +16,7 @@ class SpaceDataLinkFramerDeframer(FramerDeframer):
     protocols. This FramerDeframer is used for framing TC data for uplink and deframing TM data for downlink.
     """
 
+    # As per CCSDS standard
     SEQUENCE_NUMBER_MAXIMUM = 256
     TC_HEADER_SIZE = 5
     TM_HEADER_SIZE = 6
@@ -30,12 +33,43 @@ class SpaceDataLinkFramerDeframer(FramerDeframer):
     )
     CRC_CALCULATOR = crc.Calculator(CRC_CCITT_CONFIG)
 
+    # For backwards compatibility if not found in dictionary (loaded by ConfigManager)
+    FALLBACK_SCID = 0x44
+    FALLBACK_FRAME_SIZE = 1024
+
     def __init__(self, scid, vcid, frame_size):
-        """ """
-        self.scid = scid
-        self.vcid = vcid
-        self.frame_size = frame_size
+        """Initialize with the given spacecraft id, virtual channel id, and frame size.
+        If scid or frame_size are None, they will be pulled from ConfigManager constants
+        if present, or use fallback values."""
+        dict_scid = None
+        dict_frame_size = None
+        try:
+            dict_scid = ConfigManager.get_instance().get_constant("ComCfg.SpacecraftId")
+        except ConfigBadTypeException:
+            pass  # Config value not found, move on
+        try:
+            dict_frame_size = ConfigManager.get_instance().get_constant(
+                "ComCfg.TmFrameFixedSize"
+            )
+        except ConfigBadTypeException:
+            pass  # Config value not found, move on
+        if scid is not None and dict_scid is not None and scid != dict_scid:
+            print(
+                f"[WARNING] SCID value specified through CLI argument does not match value"
+                f" loaded from the dictionary. CLI={scid}, Dictionary={dict_scid}",
+                file=sys.stderr,
+            )
+        if frame_size is not None and dict_frame_size is not None and frame_size != dict_frame_size:
+            print(
+                f"[WARNING] TM frame size value specified through CLI argument does not match value"
+                f" loaded from the dictionary. CLI={frame_size}, Dictionary={dict_frame_size}",
+                file=sys.stderr,
+            )
         self.sequence_number = 0
+        self.vcid = vcid
+        # Priority order: command line arg > dictionary value > fallback value
+        self.scid = scid or dict_scid or self.FALLBACK_SCID
+        self.frame_size = frame_size or dict_frame_size or self.FALLBACK_FRAME_SIZE
 
     def frame(self, data):
         """Frame the supplied data in a TC frame"""
@@ -148,8 +182,7 @@ class SpaceDataLinkFramerDeframer(FramerDeframer):
         return {
             ("--scid",): {
                 "type": lambda input_arg: int(input_arg, 0),
-                "help": "Spacecraft ID",
-                "default": 0x44,
+                "help": "Spacecraft ID (if specified, overrides dictionary ComCfg value)",
                 "required": False,
             },
             ("--vcid",): {
@@ -160,8 +193,7 @@ class SpaceDataLinkFramerDeframer(FramerDeframer):
             },
             ("--frame-size",): {
                 "type": lambda input_arg: int(input_arg, 0),
-                "help": "Fixed Size of TM Frames",
-                "default": 1024,
+                "help": "Fixed Size of TM Frames (if specified, overrides dictionary ComCfg value)",
                 "required": False,
             },
         }
@@ -176,12 +208,11 @@ class SpaceDataLinkFramerDeframer(FramerDeframer):
             scid: spacecraft id
             vcid: virtual channel id
         """
-        if scid is None:
-            raise TypeError(f"Spacecraft ID not specified")
-        if scid < 0:
-            raise TypeError(f"Spacecraft ID {scid} is negative")
-        if scid > 0x3FF:
-            raise TypeError(f"Spacecraft ID {scid} is larger than {0x3FF}")
+        if scid is not None:
+            if scid < 0:
+                raise TypeError(f"Spacecraft ID {scid} is negative")
+            if scid > 0x3FF:
+                raise TypeError(f"Spacecraft ID {scid} is larger than {0x3FF}")
 
         if vcid is None:
             raise TypeError(f"Virtual Channel ID not specified")
@@ -190,7 +221,7 @@ class SpaceDataLinkFramerDeframer(FramerDeframer):
         if vcid > 0x3F:
             raise TypeError(f"Virtual Channel ID {vcid} is larger than {0x3FF}")
 
-        if frame_size < 0:
+        if frame_size is not None and frame_size < 0:
             raise TypeError(f"TM Fixed Frame size {frame_size} is negative")
 
     @classmethod

@@ -1,6 +1,8 @@
 import pytest
 from fprime_gds.common.communication.ccsds.space_packet import SpacePacketFramerDeframer
 from spacepackets.ccsds.spacepacket import SpacePacketHeader, PacketType, SpacePacket
+from fprime_gds.common.utils.data_desc_type import DataDescType
+from fprime_gds.common.utils.config_manager import ConfigManager
 
 @pytest.fixture
 def framer_deframer():
@@ -8,20 +10,25 @@ def framer_deframer():
 
 def test_frame_valid_data(framer_deframer):
     """Test framing valid data (if applicable)."""
-    # Prefix with 4 bytes corresponding to the APID
-    data = b"\x00\x00\x00\x01test_payload"
+    # Prefix with Descriptor, as expected by framer
+    test_descriptor = DataDescType["FW_PACKET_UNKNOWN"]
+    descriptor = ConfigManager.get_instance().get_type("FwPacketDescriptorType")
+    descriptor.val = test_descriptor.value
+    data = descriptor.serialize() + b"test_payload"
     framed_data = framer_deframer.frame(data)
     header = SpacePacketHeader.unpack(framed_data)
     assert header.packet_type == PacketType.TC
-    assert header.apid == 1
+    assert header.apid == test_descriptor.value
     assert header.data_len == len(data) - 1
     assert header.ccsds_version == 0b000  # Default version for CCSDS packets
     assert header.seq_count == 0
 
 def test_frame_invalid_data(framer_deframer):
     """Test framing valid data with an incorrect DataDescType prefixed."""
-    # Prefix with 4 bytes corresponding to the DataDescType
-    data = b"\xff\xff\xff\xff" + b"test_payload"
+    # Prefix with 2 bytes corresponding to the DataDescType (FF FF not valid)
+    descriptor = ConfigManager.get_instance().get_type("FwPacketDescriptorType")
+    descriptor.val = 0xFFFF # invalid value
+    data = descriptor.serialize() + b"test_payload"
     # Invalid DataDescType, should raise ValueError
     with pytest.raises(ValueError):
         framer_deframer.frame(data)

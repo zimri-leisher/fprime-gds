@@ -14,14 +14,16 @@ from pathlib import Path
 import fprime_gds.common.loaders.ch_xml_loader
 import fprime_gds.common.loaders.cmd_xml_loader
 import fprime_gds.common.loaders.event_xml_loader
-import fprime_gds.common.loaders.fw_type_json_loader
 import fprime_gds.common.loaders.pkt_json_loader
 import fprime_gds.common.loaders.pkt_xml_loader
 
 # JSON Loaders
-import fprime_gds.common.loaders.ch_json_loader
-import fprime_gds.common.loaders.cmd_json_loader
-import fprime_gds.common.loaders.event_json_loader
+from fprime_gds.common.loaders import ch_json_loader
+from fprime_gds.common.loaders import cmd_json_loader
+from fprime_gds.common.loaders import event_json_loader
+from fprime_gds.common.loaders import type_json_loader
+from fprime_gds.common.loaders import constant_json_loader
+
 
 class Dictionaries:
     """
@@ -46,7 +48,8 @@ class Dictionaries:
         self._event_name_dict = None
         self._channel_name_dict = None
         self._packet_dict = None
-        self._fw_type_name_dict = None
+        self._typedefs_name_dict = None
+        self._constant_name_dict = None
         self._versions = None
         self._metadata = None
         self._dictionary_path = None
@@ -69,28 +72,23 @@ class Dictionaries:
 
         if Path(dictionary).is_file() and ".json" in Path(dictionary).suffixes:
             # Events
-            json_event_loader = (
-                fprime_gds.common.loaders.event_json_loader.EventJsonLoader(dictionary)
-            )
+            json_event_loader = event_json_loader.EventJsonLoader(dictionary)
             self._event_name_dict = json_event_loader.get_name_dict(None)
             self._event_id_dict = json_event_loader.get_id_dict(None)
             # Commands
-            json_command_loader = (
-                fprime_gds.common.loaders.cmd_json_loader.CmdJsonLoader(dictionary)
-            )
+            json_command_loader = cmd_json_loader.CmdJsonLoader(dictionary)
             self._command_name_dict = json_command_loader.get_name_dict(None)
             self._command_id_dict = json_command_loader.get_id_dict(None)
             # Channels
-            json_channel_loader = fprime_gds.common.loaders.ch_json_loader.ChJsonLoader(
-                dictionary
-            )
+            json_channel_loader = ch_json_loader.ChJsonLoader(dictionary)
             self._channel_name_dict = json_channel_loader.get_name_dict(None)
             self._channel_id_dict = json_channel_loader.get_id_dict(None)
-            # Fw Types
-            fw_types_loader = fprime_gds.common.loaders.fw_type_json_loader.FwTypeJsonLoader(
-                dictionary
-            )
-            self._fw_type_name_dict = fw_types_loader.get_name_dict(None)
+            # Load all type definitions to retrieve config types not used elsewhere
+            types_loader = type_json_loader.TypeJsonLoader(dictionary)
+            self._typedefs_name_dict = types_loader.get_name_dict(None)
+            # Load all constant definitions
+            constant_loader = constant_json_loader.ConstantJsonLoader(dictionary)
+            self._constant_name_dict = constant_loader.get_name_dict(None)
             # Metadata
             self._versions = json_event_loader.get_versions()
             self._metadata = json_event_loader.get_metadata().copy()
@@ -188,11 +186,23 @@ class Dictionaries:
     def channel_name(self):
         """Channel dictionary by name"""
         return self._channel_name_dict
-    
+
     @property
-    def fw_type_name(self):
-        """Fw type name dictionary by name"""
-        return self._fw_type_name_dict
+    def typedefs_name(self):
+        """Type definitions dictionary by name
+        Returns:
+            dict[str, DictionaryType]
+        """
+        return self._typedefs_name_dict
+
+    @property
+    def constant_name(self):
+        """Constants dictionary by name. Constants do not carry type information in FPP
+        and are simply name to int mappings in Python.
+        Returns:
+            dict[str, int]
+        """
+        return self._constant_name_dict
 
     @property
     def project_version(self):
@@ -214,17 +224,17 @@ class Dictionaries:
 
     @property
     def dictionary_path(self):
-        """ Dictionary Path """
+        """Dictionary Path"""
         return self._dictionary_path
 
     @property
     def packet_spec_path(self):
-        """ Dictionary Path """
+        """Dictionary Path"""
         return self._packet_spec_path
-    
+
     @property
     def packet_set_name(self):
-        """ Dictionary Path """
+        """Dictionary Path"""
         return self._packet_set_name
 
     @property

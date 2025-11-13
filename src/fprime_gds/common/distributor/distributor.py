@@ -54,11 +54,10 @@ class Distributor(DataHandler):
         self.__buf = bytearray(b"")
         # Setup key framing
         self.key_frame = None
-        tmp_frame = config.get("framing", "use_key", fallback="false")
-        if tmp_frame.lower() == "true":
-            self.key_frame = int(config.get("framing", "key_val"), 16)
-        self.key_obj = config.get_type("key_val")
-        self.len_obj = config.get_type("msg_len")
+        if config.get_config("use_key"):
+            self.key_frame = int(config.get_config("key_val"), 16)
+        self.key_obj = config.get_config("key_val")()
+        self.len_obj = config.get_config("msg_len")()
         self.desc_obj = config.get_type("FwPacketDescriptorType")
 
     # NOTE we could use either the type of the object or an enum as the type argument.
